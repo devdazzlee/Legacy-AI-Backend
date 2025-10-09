@@ -1,0 +1,78 @@
+# FastAPI Server Running Commands
+
+##  Quick Start Command
+```bash
+cd "/Users/mac/Desktop/Ahmed Work/AI-Backend"
+source venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## 📋 Step-by-Step Commands
+
+### 1. Navigate to Backend Directory
+```bash
+cd "/Users/mac/Desktop/Ahmed Work/AI-Backend"
+```
+
+### 2. Activate Virtual Environment
+```bash
+source venv/bin/activate
+```
+
+### 3. Start FastAPI Server
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+## 🔧 Alternative Commands
+
+### Development Mode (with auto-reload)
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+```
+
+### Production Mode (no reload)
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### Custom Port
+```bash
+uvicorn main:app --host 0.0.0.0 --port 3000 --reload
+```
+
+## 🌐 Server URLs
+
+- **Local:** http://localhost:8000
+- **Network:** http://192.168.110.25:8000
+- **API Docs:** http://localhost:8000/docs
+- **Health Check:** http://localhost:8000/health
+
+## ✅ Verification
+
+Once running, you should see:
+```
+INFO:     Started server process [xxxxx]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+```
+
+## 🛠️ Troubleshooting
+
+### If port 8000 is busy:
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+```
+
+### If virtual environment issues:
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Check if server is running:
+```bash
+curl http://localhost:8000/health
+```
