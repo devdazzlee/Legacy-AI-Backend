@@ -12,7 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import the FastAPI app from main.py
 from main import app
 
-# Export the app for Vercel
-# Vercel will use this as the ASGI application
-handler = app
+# Vercel expects the app to be named 'app' for ASGI applications
+# No need for a separate handler
+__all__ = ['app']
 
