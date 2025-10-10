@@ -10,6 +10,9 @@ AZURE_OPENAI_ENDPOINT=your-azure-endpoint-url
 AZURE_OPENAI_KEY=your-azure-api-key-here
 AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=gpt-4o
+
+# OpenAI API Key (for Whisper speech-to-text)
+OPENAI_API_KEY=your-openai-api-key-here
 ```
 
 ## Important Notes

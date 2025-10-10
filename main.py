@@ -82,6 +82,21 @@ class ChatbotRequest(BaseModel):
 class ChatbotResponse(BaseModel):
     response: str
 
+class PrescreenerRequest(BaseModel):
+    message: str
+    clientId: str
+    context: dict = {}
+
+class PrescreenerResponse(BaseModel):
+    isApproved: bool
+    status: str  # "approved" or "rejected"
+    userMessage: str  # Original message
+    exampleMessage: str  # AI-generated example (only shown if rejected)
+    feedback: str  # Clear acknowledgement
+    detectedIssues: List[str]  # Safety incidents detected
+    requiredActions: List[str]  # What user must do next
+    canSubmit: bool  # Whether user can submit the current message
+
 # Azure OpenAI Service
 class AzureOpenAIService:
     """Service class for Azure OpenAI integration"""
@@ -519,6 +534,175 @@ Respond with helpful guidance only, no additional formatting or explanations.
             fallback_section = context.get("currentSection", "Progress Log")
             fallback_services = ", ".join(context.get("selectedServices", [])) if context.get("selectedServices") else "general services"
             return f"I'm here to help with {fallback_section}. I can provide guidance on:\n\n• How to fill out this section properly\n• Examples of good responses\n• Understanding requirements\n• Best practices for documentation\n\nYour selected services are: {fallback_services}\n\nPlease ask me a specific question, and I'll provide detailed guidance!"
+    
+    def prescreener_strict_validation(self, message: str, client_id: str, context: dict) -> Dict[str, Any]:
+        """
+        Strict validation for AI Prescreener - follows rigid approval rules
+        
+        Rules:
+        1. Only approve messages that are already high-quality and detailed
+        2. Detect safety incidents (falls, fever, medication issues, etc.)
+        3. Provide example messages for rejected content (users must retype)
+        4. Never auto-replace user's message
+        """
+        try:
+            if not self._initialized:
+                self._initialize_client()
+            
+            # Analyze message quality and safety
+            message_lower = message.lower().strip()
+            word_count = len(message.split())
+            
+            # Detect safety incidents
+            detected_issues = []
+            critical_keywords = {
+                "fall": ["fell", "fall", "falling", "fallen", "slipped", "tripped"],
+                "fever": ["fever", "temperature", "hot", "burning up", "feverish"],
+                "injury": ["injured", "hurt", "bleeding", "bruise", "cut", "wound"],
+                "medication_error": ["wrong medication", "wrong dose", "missed medication"],
+                "emergency": ["emergency", "911", "ambulance", "urgent care", "hospital"]
+            }
+            
+            for issue_type, keywords in critical_keywords.items():
+                for keyword in keywords:
+                    if keyword in message_lower:
+                        detected_issues.append(f"🚨 {issue_type.replace('_', ' ').title()} detected: '{keyword}'")
+                        break
+            
+            # STRICT Quality checks - must meet AI example standards
+            # AI examples are 50-80 words, so we require similar length and detail
+            is_too_short = word_count < 40  # Increased from 15 to 40
+            is_vague = any(word in message_lower for word in ["good", "fine", "okay", "nice", "great", "well"]) and word_count < 50
+            lacks_detail = word_count < 50 and len(detected_issues) == 0  # Increased from 25 to 50
+            lacks_specifics = not any(word in message_lower for word in ["client", "participated", "completed", "assisted", "engaged", "showed", "demonstrated", "performed"])
+            
+            # Determine if message should be approved
+            is_approved = False
+            status = "rejected"
+            feedback = ""
+            example_message = ""
+            required_actions = []
+            
+            # Critical safety events are always rejected for review
+            if detected_issues:
+                status = "rejected"
+                is_approved = False
+                feedback = f"❌ MESSAGE REJECTED: Critical safety event detected. This requires detailed documentation and supervisor review."
+                required_actions = [
+                    "Document exact time and location",
+                    "Describe what happened in detail",
+                    "List all actions taken",
+                    "Contact supervisor immediately"
+                ]
+                
+                # Generate AI example for safety incident
+                example_prompt = f"""
+You are a healthcare documentation expert. The user reported a safety incident but needs a proper example.
+
+USER'S MESSAGE: "{message}"
+DETECTED ISSUES: {", ".join(detected_issues)}
+
+Generate a COMPLETE, DETAILED example of how this incident should be documented. Include:
+- Exact time and location
+- What happened (specific details)
+- Client's condition
+- Actions taken immediately
+- Whether emergency services were contacted
+- Current status
+
+Write as if you are the healthcare worker documenting the actual incident. Be specific and professional.
+
+Return ONLY the example message, no other text.
+"""
+                
+                example_response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=[
+                        {"role": "system", "content": "You are a healthcare documentation expert. Provide detailed example messages."},
+                        {"role": "user", "content": example_prompt}
+                    ],
+                    max_tokens=400,
+                    temperature=0.7
+                )
+                example_message = example_response.choices[0].message.content.strip()
+                
+            elif is_too_short or is_vague or lacks_detail or lacks_specifics:
+                status = "rejected"
+                is_approved = False
+                feedback = f"❌ MESSAGE REJECTED: Message is too brief or lacks sufficient detail (only {word_count} words).\n\nRequired: 50+ words with specific details about client interactions. Review the EXAMPLE below - your message must be SIMILAR in length and detail."
+                required_actions = [
+                    "Add specific details about activities performed",
+                    "Describe client's mood, behavior, and engagement",
+                    "Include observable facts and client responses",
+                    "Write AT LEAST 50-60 words with healthcare terminology",
+                    "Match the detail level shown in the example"
+                ]
+                
+                # Generate AI example for brief message
+                selected_services = context.get("selectedServices", ["general care"])
+                services_text = ", ".join(selected_services[:3])
+                
+                example_prompt = f"""
+Generate a detailed, professional progress note EXAMPLE for a healthcare shift.
+
+SERVICES PROVIDED: {services_text}
+CONTEXT: {context.get("currentSection", "Overall day observations")}
+
+Create a realistic EXAMPLE that the user CANNOT submit directly - they must write their own version:
+- 50-70 words minimum
+- Describes the client's mood, engagement, and specific behaviors
+- Mentions specific activities completed with detail
+- Notes any challenges or successes observed
+- Uses professional healthcare language
+- Includes specific, observable facts (not vague terms like "good" or "fine")
+
+Return ONLY the example message (no labels, no extra text).
+"""
+                
+                example_response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=[
+                        {"role": "system", "content": "You are a healthcare documentation expert. Provide detailed example messages."},
+                        {"role": "user", "content": example_prompt}
+                    ],
+                    max_tokens=250,
+                    temperature=0.7
+                )
+                example_message = example_response.choices[0].message.content.strip()
+                
+            else:
+                # Message is detailed enough - APPROVE
+                # Only approved if: 50+ words, specific details, professional language
+                status = "approved"
+                is_approved = True
+                feedback = f"✅ MESSAGE APPROVED: Your message meets quality standards ({word_count} words with sufficient detail). You may submit YOUR OWN message."
+                required_actions = ["Review your message one final time", "Click 'Submit Approved' to submit YOUR message"]
+                example_message = ""  # No example needed for approved messages
+            
+            return {
+                "isApproved": is_approved,
+                "status": status,
+                "userMessage": message,
+                "exampleMessage": example_message,
+                "feedback": feedback,
+                "detectedIssues": detected_issues,
+                "requiredActions": required_actions,
+                "canSubmit": is_approved
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in prescreener validation: {str(e)}")
+            # Fail safe - reject on error
+            return {
+                "isApproved": False,
+                "status": "rejected",
+                "userMessage": message,
+                "exampleMessage": "Client had a positive day, actively participating in all care activities. They showed good engagement during personal care routines and maintained positive mood throughout the shift. No concerns noted.",
+                "feedback": "⚠️ System error during validation. Please review your message and try again.",
+                "detectedIssues": ["System validation error"],
+                "requiredActions": ["Review your message", "Try analyzing again"],
+                "canSubmit": False
+            }
 
 # Initialize service
 azure_service = AzureOpenAIService()
@@ -668,6 +852,120 @@ async def ask_chatbot(request: ChatbotRequest):
         logger.error(f"Error in chatbot: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in chatbot: {str(e)}")
 
+@app.post("/prescreener/validate-strict", response_model=PrescreenerResponse)
+async def prescreener_validate_strict(request: PrescreenerRequest):
+    """
+    Strict AI Prescreener validation with voice support
+    
+    Rules:
+    - Only approves high-quality, detailed messages
+    - Detects safety incidents (falls, fever, injuries, etc.)
+    - Provides example messages for rejected content (users must retype)
+    - Never auto-replaces user's message
+    - Supports voice input/output
+    """
+    try:
+        logger.info(f"🔍 PRESCREENER - Validating message for client: {request.clientId}")
+        logger.info(f"📝 Message: {request.message}")
+        
+        validation_result = azure_service.prescreener_strict_validation(
+            request.message,
+            request.clientId,
+            request.context
+        )
+        
+        logger.info(f"✅ PRESCREENER - Status: {validation_result['status']}")
+        logger.info(f"📊 Can Submit: {validation_result['canSubmit']}")
+        
+        return PrescreenerResponse(
+            isApproved=validation_result["isApproved"],
+            status=validation_result["status"],
+            userMessage=validation_result["userMessage"],
+            exampleMessage=validation_result["exampleMessage"],
+            feedback=validation_result["feedback"],
+            detectedIssues=validation_result["detectedIssues"],
+            requiredActions=validation_result["requiredActions"],
+            canSubmit=validation_result["canSubmit"]
+        )
+    except Exception as e:
+        logger.error(f"Error in prescreener validation: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in prescreener validation: {str(e)}")
+
+@app.post("/speech-to-text")
+async def speech_to_text(request: dict):
+    """
+    Convert speech audio to text using OpenAI Whisper API
+    
+    Accepts base64 encoded audio and returns transcribed text
+    """
+    import base64
+    import tempfile
+    import os
+    
+    try:
+        audio_data = request.get("audio_data")
+        audio_format = request.get("format", "m4a")
+        
+        if not audio_data:
+            raise HTTPException(status_code=400, detail="No audio data provided")
+        
+        logger.info(f"🎤 SPEECH-TO-TEXT - Received audio ({len(audio_data)} bytes base64)")
+        logger.info(f"🎤 Audio format: {audio_format}")
+        
+        # Decode base64 audio
+        audio_bytes = base64.b64decode(audio_data)
+        logger.info(f"🎤 Decoded audio: {len(audio_bytes)} bytes")
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False) as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_audio_path = temp_audio.name
+            logger.info(f"🎤 Saved to temp file: {temp_audio_path}")
+        
+        try:
+            # Use OpenAI's Whisper API directly (not Azure)
+            from openai import OpenAI
+            
+            # Initialize OpenAI client for Whisper (separate from Azure)
+            openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            
+            with open(temp_audio_path, "rb") as audio_file:
+                transcription = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    language="en"
+                )
+            
+            transcribed_text = transcription.text
+            logger.info(f"✅ SPEECH-TO-TEXT - Transcription: {transcribed_text}")
+            
+            # Clean up temp file
+            os.unlink(temp_audio_path)
+            
+            return {
+                "success": True,
+                "text": transcribed_text,
+                "language": "en"
+            }
+            
+        except Exception as whisper_error:
+            logger.error(f"❌ Whisper API error: {str(whisper_error)}")
+            logger.error(f"❌ Error type: {type(whisper_error)}")
+            # Clean up temp file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+            
+            # Fallback: Return a message indicating transcription is unavailable
+            return {
+                "success": False,
+                "text": "",
+                "error": "Speech-to-text service temporarily unavailable. Please type your message."
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ SPEECH-TO-TEXT ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in speech-to-text: {str(e)}")
+
 @app.post("/ai-prescreener/analyze-shift")
 async def analyze_shift_with_ai_prescreener(request: dict):
     """Analyze shift data using AI Prescreener system"""
@@ -797,20 +1095,6 @@ async def get_ai_prescreener_status():
         }
 
 # AI Prescreener endpoints
-class PrescreenerRequest(BaseModel):
-    message: str
-    clientId: str
-    context: dict
-
-class PrescreenerResponse(BaseModel):
-    isAllowed: bool
-    filteredMessage: str = ""
-    restrictionsApplied: List[str] = []
-    suggestions: List[str] = []
-    narrative: str = ""
-    challengesNoted: bool = False
-    challengesDescription: str = ""
-
 class ConflictDetectionRequest(BaseModel):
     concepts: List[str]
     clientId: str
