@@ -923,18 +923,36 @@ async def speech_to_text(request: dict):
             logger.info(f"🎤 Saved to temp file: {temp_audio_path}")
         
         try:
-            # Use OpenAI's Whisper API directly (not Azure)
-            from openai import OpenAI
+            # Use Azure OpenAI for Whisper (same credentials as GPT-4)
+            # Azure OpenAI supports Whisper via audio.transcriptions API
             
-            # Initialize OpenAI client for Whisper (separate from Azure)
-            openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            logger.info("🔄 Using Azure Cognitive Services for Whisper transcription...")
             
+            # Get Whisper configuration from environment
+            whisper_deployment = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
+            whisper_endpoint = os.getenv("AZURE_WHISPER_ENDPOINT", "https://hakeem-4411-resource.cognitiveservices.azure.com/openai/deployments/whisper/audio/transcriptions")
+            whisper_key = os.getenv("AZURE_WHISPER_KEY", os.getenv("AZURE_OPENAI_KEY"))
+            whisper_api_version = os.getenv("AZURE_WHISPER_API_VERSION", "2024-06-01")
+            
+            logger.info(f"🎤 Whisper endpoint: {whisper_endpoint}")
+            logger.info(f"🎤 API version: {whisper_api_version}")
+            
+            # Create Azure client for Whisper (Cognitive Services endpoint)
+            whisper_client = AzureOpenAI(
+                api_key=whisper_key,
+                api_version=whisper_api_version,
+                azure_endpoint="https://hakeem-4411-resource.cognitiveservices.azure.com/"
+            )
+            
+            # Use Azure Cognitive Services Whisper
             with open(temp_audio_path, "rb") as audio_file:
-                transcription = openai_client.audio.transcriptions.create(
-                    model="whisper-1",
+                transcription = whisper_client.audio.transcriptions.create(
+                    model=whisper_deployment,
                     file=audio_file,
                     language="en"
                 )
+            
+            logger.info("✅ Used Azure OpenAI Whisper successfully")
             
             transcribed_text = transcription.text
             logger.info(f"✅ SPEECH-TO-TEXT - Transcription: {transcribed_text}")
