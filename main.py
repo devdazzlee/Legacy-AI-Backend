@@ -266,6 +266,32 @@ class AzureOpenAIService:
         # Default to first model if not found
         return self.models[0]
     
+    def _get_model_token_params(self, model_name: str):
+        """
+        Get model-specific token parameters based on model requirements
+        
+        Returns:
+            dict with appropriate token parameter name and value
+        """
+        # Newer o-series models (o4-mini, o3-mini) require max_completion_tokens instead of max_tokens
+        if model_name in ['o4-mini', 'o3-mini']:
+            return {"max_completion_tokens": 4096}  # Conservative limit for o-series
+        
+        # gpt-35-turbo has a 4096 completion token limit
+        if model_name == 'gpt-35-turbo':
+            return {"max_tokens": 4096}  # Don't exceed model's limit
+        
+        # gpt-4o and other models can use max_tokens with higher limits
+        if model_name == 'gpt-4o':
+            return {"max_tokens": 16384}  # Higher limit for gpt-4o
+        
+        # DeepSeek-R1 uses max_tokens (different endpoint)
+        if model_name == 'DeepSeek-R1':
+            return {"max_tokens": 6553}  # Original value works for DeepSeek
+        
+        # Default fallback
+        return {"max_tokens": 4096}
+    
     def _create_client_for_model(self, deployment_name: str = None):
         """Create Azure OpenAI client for a specific model"""
         model_config = self._get_model_config(deployment_name)
@@ -371,19 +397,22 @@ class AzureOpenAIService:
                 
                 # Prepare the request payload
                 # Different models may need different parameters
+                # Get model-specific token parameters
+                token_params = self._get_model_token_params(model_config['name'])
+                
                 if model_config['name'] == 'DeepSeek-R1':
                     payload = {
                         "model": model_config["deployment"],
                         "messages": self.conversations[conversation_key],
-                        "max_tokens": 6553,
+                        **token_params,  # Use model-specific token params
                         "temperature": 0.7
                     }
                 else:
-                    # For Azure OpenAI deployments, use minimal payload first
-                    # Some models (o4-mini, o3-mini) may not support all parameters
+                    # For Azure OpenAI deployments, use minimal payload
+                    # Use model-specific token parameters (max_tokens or max_completion_tokens)
                     payload = {
                         "messages": self.conversations[conversation_key],
-                        "max_tokens": 6553,
+                        **token_params,  # Use model-specific token params
                         "temperature": 0.7
                     }
                     
@@ -397,7 +426,10 @@ class AzureOpenAIService:
                 logger.info(f"⚠️ Using DIRECT httpx call - SDK will NOT be used, NO automatic retries!")
                 logger.info(f"📤 Payload being sent to {model_config['name']}:")
                 logger.info(f"   - Messages count: {len(self.conversations[conversation_key])}")
-                logger.info(f"   - Max tokens: {payload.get('max_tokens', 'N/A')}")
+                # Log token parameter (could be max_tokens or max_completion_tokens)
+                token_param_value = payload.get('max_tokens') or payload.get('max_completion_tokens', 'N/A')
+                token_param_name = 'max_completion_tokens' if 'max_completion_tokens' in payload else 'max_tokens'
+                logger.info(f"   - {token_param_name}: {token_param_value}")
                 logger.info(f"   - Temperature: {payload.get('temperature', 'N/A')}")
                 logger.info(f"   - Payload keys: {list(payload.keys())}")
                 
