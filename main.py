@@ -1382,48 +1382,123 @@ VALIDATION RULES:
 
 🚨🚨🚨 CRITICAL EMERGENCY DETECTION - READ THIS FIRST 🚨🚨🚨
 
-REVIEW RULES (MANDATORY - NO EXCEPTIONS):
-⚠️ YOU MUST SET "status": "review" if the answer contains ANY of these emergency indicators:
-  • Fall, fell, falling, slip, slipped, trip, tripped, head injury, hit head, bumped head
-  • Loss of consciousness, fainted, passed out, unconscious, blackout
-  • Injury, injured, bleeding, blood, burn, burned, fracture, broke bone, broken
-  • Choking, choked, seizure, seizures, convulsion, convulsions, fit
-  • Medication error, wrong medication, missed dose, overdose, overdose
-  • Abuse, neglect, assaulted, attacked, hit, hurt, harmed
-  • Elopement, eloped, wandering, wandered, missing, lost, can't find
-  • Aggression, aggressive, violent, violence, hit, punched, kicked, attacked
-  • Restraint, restrained, held down, physical intervention
-  • Property damage, broke, broken, destroyed, damaged
-  • 911, called 911, emergency, emergency services, ambulance, paramedics
-  • ER, emergency room, hospital, urgent care, taken to hospital, transported
-  • Police, cops, law enforcement, authorities called
-  • Any variation or combination of the above terms
+⚠️ MANDATORY EMERGENCY DETECTION PROTOCOL ⚠️
 
-⚠️ EXAMPLES THAT MUST TRIGGER REVIEW:
-  - "Client fell down" → status: "review", safety_concerns: ["fall"]
-  - "Client had a seizure" → status: "review", safety_concerns: ["seizure"]
-  - "Client injured their arm" → status: "review", safety_concerns: ["injury"]
-  - "Called 911" → status: "review", safety_concerns: ["911_called"]
-  - "Client was bleeding" → status: "review", safety_concerns: ["injury"]
-  - "Client wandered away" → status: "review", safety_concerns: ["elopement"]
-  - "Medication was given incorrectly" → status: "review", safety_concerns: ["medication_error"]
-  - "Client became aggressive and hit staff" → status: "review", safety_concerns: ["aggression"]
-  - "Client lost consciousness" → status: "review", safety_concerns: ["loss_of_consciousness"]
+YOUR PRIMARY TASK: Before validating word count, grammar, or completeness, FIRST scan the entire message for ANY emergency conditions that require immediate attention.
 
-⚠️ WHEN YOU DETECT ANY EMERGENCY CONDITION:
-  1. IMMEDIATELY set "status": "review" (NOT "approve", NOT "reject")
-  2. MUST populate "safety_concerns" with at least one label from the list above
-  3. Use concise, professional labels: ["fall"], ["seizure"], ["injury"], ["911_called"], ["medication_error"], ["elopement"], ["aggression"], ["loss_of_consciousness"], etc.
-  4. Still provide a complete "suggested_answer" that is safe and professional
-  5. Do NOT ignore emergency conditions - they ALWAYS require review
+🎯 EMERGENCY DETECTION PROCESS (Follow These Steps):
 
+STEP 1: READ THE ENTIRE MESSAGE CAREFULLY
+- Don't just scan for keywords - understand the FULL CONTEXT
+- Look for situations that indicate a problem, incident, or concerning event
+- Pay attention to the overall meaning, not individual words
+
+STEP 2: IDENTIFY EMERGENCY INDICATORS
+An emergency exists if the message describes ANY situation requiring immediate attention, documentation, or supervisor notification:
+
+CATEGORY 1: MEDICAL EMERGENCIES
+✅ Set "review" if message describes:
+  - Health issues: fever, illness, sickness, symptoms, medical condition, health problem
+  - Medical events: seizure, convulsion, loss of consciousness, fainting, unconscious
+  - Breathing problems: choking, difficulty breathing, respiratory issues
+  - Severe symptoms: high temperature, burning up, concerning symptoms, medical emergency
+
+CATEGORY 2: PHYSICAL INCIDENTS
+✅ Set "review" if message describes:
+  - Falls, slips, trips: fell, falling, slipped, tripped, lost balance
+  - Injuries: injured, hurt, bleeding, cut, burn, fracture, broke bone, head injury
+  - Accidents: any physical incident resulting in harm or potential harm
+
+CATEGORY 3: SAFETY INCIDENTS
+✅ Set "review" if message describes:
+  - Missing client: wandered away, can't find, lost, elopement, went missing
+  - Safety concerns: any situation where client safety is at risk
+
+CATEGORY 4: BEHAVIORAL EMERGENCIES
+✅ Set "review" if message describes:
+  - Aggression: violent, hit, punched, kicked, attacked, aggressive behavior
+  - Self-harm or harm to others: any dangerous behavior
+  - Severe behavioral episodes: requires intervention or restraint
+
+CATEGORY 5: MEDICATION ERRORS
+✅ Set "review" if message describes:
+  - Wrong medication given, missed critical dose, overdose, medication mistake
+  - Any medication-related incident that could cause harm
+
+CATEGORY 6: ABUSE OR NEGLECT
+✅ Set "review" if message describes:
+  - Abuse, neglect, assault, harm, mistreatment
+
+CATEGORY 7: EMERGENCY SERVICES
+✅ Set "review" if message describes:
+  - 911 called, ambulance, emergency services, ER visit, hospital, urgent care
+  - Police called, authorities contacted
+
+CATEGORY 8: ANY OTHER EMERGENCY
+✅ Set "review" if message describes:
+  - Any situation that requires immediate documentation
+  - Any incident that needs supervisor notification
+  - Any concerning event that doesn't fit normal daily routine
+
+STEP 3: EVALUATE SEVERITY AND URGENCY
+Ask yourself these questions:
+  ❓ "Does this describe a problem, incident, or concerning situation?"
+  ❓ "Would a care worker need to document this as an incident?"
+  ❓ "Would this require supervisor notification?"
+  ❓ "Is this outside normal daily routine care?"
+  
+If YES to any question → It's likely an emergency → Set "review"
+
+STEP 4: DECISION RULES
+✅ SET "status": "review" IF:
+  - Message describes ANY medical condition, symptom, or health issue (even brief like "client feel fever")
+  - Message describes ANY injury, fall, or physical incident
+  - Message describes ANY safety concern or incident
+  - Message describes ANY behavior requiring intervention
+  - Message describes medication errors or problems
+  - Message describes abuse, neglect, or harm
+  - Message mentions emergency services (911, ambulance, hospital, etc.)
+  - Message describes ANY situation requiring immediate documentation
+  
 ❌ DO NOT set "review" for:
-  - Ordinary illness: "client was sick", "client had a cold", "client had a headache" (unless severe/unconscious)
-  - Minor discomfort: "client was uncomfortable", "client was tired"
-  - Routine care: "client took medication", "client ate lunch"
-  - Positive events: "client had a good day", "client enjoyed activities"
+  - Routine daily activities: "client ate lunch", "client participated in activities"
+  - Normal care: "client took medication as scheduled", "client had a shower"
+  - Positive routine events: "client had a good day", "client enjoyed activities"
+  - Minor discomfort that's normal: "client was a bit tired" (unless extreme)
+  - Simple statements with no incident: "client was fine", "client was happy"
 
-⚠️ WHEN IN DOUBT: If the text mentions any emergency keyword (fall, injury, seizure, 911, hospital, etc.), set "review" status.
+STEP 5: SET SAFETY CONCERNS
+When you detect an emergency:
+  1. IMMEDIATELY set "status": "review" (NOT "approve", NOT "reject")
+  2. MUST populate "safety_concerns" with appropriate label(s)
+  3. Use clear, professional labels based on what you detected:
+     - Medical conditions: ["fever"], ["medical_condition"], ["illness"], ["symptoms"]
+     - Physical incidents: ["fall"], ["injury"], ["physical_incident"]
+     - Safety: ["elopement"], ["missing"], ["safety_concern"]
+     - Behavioral: ["aggression"], ["behavioral_incident"]
+     - Medication: ["medication_error"]
+     - Emergency services: ["911_called"], ["hospital_visit"], ["emergency_services"]
+     - Other: Use your best judgment with clear label (e.g., ["abuse"], ["neglect"])
+  4. Still provide a complete "suggested_answer" that documents the incident professionally
+
+⚠️ CRITICAL REMINDERS:
+- EMERGENCY DETECTION COMES FIRST - Check for emergencies BEFORE checking word count or grammar
+- When in DOUBT, err on the side of caution - set "review" if you're unsure
+- Brief messages like "client feel fever" are EMERGENCIES - don't reject for word count
+- Context matters more than exact words - understand the situation, not just keywords
+- Better to review an emergency than miss it
+
+⚠️ EXAMPLES OF EMERGENCY DETECTION:
+✅ "client feel fever" → EMERGENCY → status: "review", safety_concerns: ["fever"]
+✅ "client fell down" → EMERGENCY → status: "review", safety_concerns: ["fall"]
+✅ "client has seizure" → EMERGENCY → status: "review", safety_concerns: ["seizure"]
+✅ "client injured arm" → EMERGENCY → status: "review", safety_concerns: ["injury"]
+✅ "client wandered away" → EMERGENCY → status: "review", safety_concerns: ["elopement"]
+✅ "called 911" → EMERGENCY → status: "review", safety_concerns: ["911_called"]
+✅ "client feel sick" → EMERGENCY → status: "review", safety_concerns: ["medical_condition"]
+✅ "client unwell" → EMERGENCY → status: "review", safety_concerns: ["medical_condition"]
+❌ "client had good day" → NOT EMERGENCY → Can proceed with normal validation
+❌ "client ate lunch" → NOT EMERGENCY → Can proceed with normal validation
 
 CRITICAL - TONE AND MESSAGING (MUST FOLLOW):
 - ALWAYS write in SECOND PERSON: Use "Your answer" or "You need to" - NEVER "The user's answer" or "The answer"
