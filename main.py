@@ -1806,7 +1806,7 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
                     
                     # CRITICAL: Return immediately - this exits the entire function
                     # No other models will be tried after this return
-                return response
+                    return response
                 else:
                     # Empty response - treat as error and try next model
                     logger.warning(f"⚠️ {deployment} returned empty response. Trying next model...")
@@ -1818,8 +1818,8 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
                     break  # Break inner loop to try next deployment
                     
             except (RateLimitError, SimpleRateLimitError) as e:
-            retry_count += 1
-            last_error = e
+                retry_count += 1
+                last_error = e
                 
                 logger.error(f"=" * 80)
                 logger.error(f"🚫 RATE LIMIT ERROR on {deployment}")
@@ -1838,7 +1838,7 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
                         "status": "failed",
                         "message": f"Rate limit (429) - exhausted {max_retries} retries"
                     })
-            
+                
                 if retry_count <= max_retries:
                     # If Azure rate limits on this model, try again immediately (no wait)
                     logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
@@ -1847,97 +1847,97 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
                     # If this model exhausted retries, cancel and try next deployment immediately
                     logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
                     break  # Break inner loop - cancel remaining retries and try next deployment
-        
-        except Exception as e:
-            last_error = e
-            error_str = str(e).lower()
-            
-            # Check if it's a rate limit error by status code
-            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                retry_count += 1
+                    
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
                 
-                logger.error(f"=" * 80)
-                logger.error(f"🚫 RATE LIMIT DETECTED on {deployment}")
-                logger.error(f"=" * 80)
-                logger.error(f"📊 Error Type: {type(e).__name__}")
-                logger.error(f"📊 Error Message: {str(e)[:500]}")
-                logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
-                logger.error(f"📊 HTTP Status: 429 (detected in error message)")
-                logger.error(f"=" * 80)
-                
-                if retry_count <= max_retries:
-                    # If Azure rate limits, try again immediately (no wait)
-                    logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
-                    continue
+                # Check if it's a rate limit error by status code
+                if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                    retry_count += 1
+                    
+                    logger.error(f"=" * 80)
+                    logger.error(f"🚫 RATE LIMIT DETECTED on {deployment}")
+                    logger.error(f"=" * 80)
+                    logger.error(f"📊 Error Type: {type(e).__name__}")
+                    logger.error(f"📊 Error Message: {str(e)[:500]}")
+                    logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
+                    logger.error(f"📊 HTTP Status: 429 (detected in error message)")
+                    logger.error(f"=" * 80)
+                    
+                    if retry_count <= max_retries:
+                        # If Azure rate limits, try again immediately (no wait)
+                        logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
+                        continue
+                    else:
+                        # If this model exhausted retries, cancel and try next deployment immediately
+                        logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
+                        break  # Break inner loop - cancel remaining retries and try next deployment
                 else:
-                    # If this model exhausted retries, cancel and try next deployment immediately
-                    logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
-                    break  # Break inner loop - cancel remaining retries and try next deployment
-            else:
-                # Non-rate-limit error - Log detailed error information
-                logger.error(f"=" * 80)
-                logger.error(f"❌ MODEL FAILURE on {deployment}")
-                logger.error(f"=" * 80)
-                logger.error(f"📊 Error Type: {type(e).__name__}")
-                logger.error(f"📊 Error Message: {str(e)[:500]}")
-                logger.error(f"📊 Full Error: {str(e)}")
-                
-                # Check for specific error types
-                if "400" in error_str or "bad request" in error_str:
-                    logger.error(f"📊 HTTP Status: 400 Bad Request")
-                    logger.error(f"📊 Reason: Invalid request format or parameters for {deployment}")
-                elif "404" in error_str or "not found" in error_str:
-                    logger.error(f"📊 HTTP Status: 404 Not Found")
-                    logger.error(f"📊 Reason: Deployment '{deployment}' not found in Azure OpenAI")
-                elif "401" in error_str or "unauthorized" in error_str:
-                    logger.error(f"📊 HTTP Status: 401 Unauthorized")
-                    logger.error(f"📊 Reason: Invalid API key or authentication failed")
-                elif "500" in error_str or "internal server error" in error_str:
-                    logger.error(f"📊 HTTP Status: 500 Internal Server Error")
-                    logger.error(f"📊 Reason: Azure OpenAI server error")
-                else:
-                    logger.error(f"📊 HTTP Status: Unknown")
-                    logger.error(f"📊 Reason: {str(e)[:200]}")
-                
-                logger.error(f"=" * 80)
-                
-                # Track failed attempt
-                error_message = str(e)[:200] if str(e) else "Unknown error"
-                if "400" in error_str or "bad request" in error_str:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Bad Request (400) - {error_message}"
-                    })
-                elif "404" in error_str or "not found" in error_str:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Not Found (404) - Deployment not found"
-                    })
-                elif "401" in error_str or "unauthorized" in error_str:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Unauthorized (401) - Authentication failed"
-                    })
-                elif "500" in error_str or "internal server error" in error_str:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Server Error (500) - {error_message}"
-                    })
-                else:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Error - {error_message}"
-                    })
-                
-                # Non-rate-limit error - IMMEDIATELY cancel and try next deployment
-                # Don't retry - just move to next model immediately
-                logger.warning(f"🛑 Canceling {deployment} - NOT retrying. Moving to next model immediately...")
-                break  # Break inner loop immediately - cancel any retries, try next model
+                    # Non-rate-limit error - Log detailed error information
+                    logger.error(f"=" * 80)
+                    logger.error(f"❌ MODEL FAILURE on {deployment}")
+                    logger.error(f"=" * 80)
+                    logger.error(f"📊 Error Type: {type(e).__name__}")
+                    logger.error(f"📊 Error Message: {str(e)[:500]}")
+                    logger.error(f"📊 Full Error: {str(e)}")
+                    
+                    # Check for specific error types
+                    if "400" in error_str or "bad request" in error_str:
+                        logger.error(f"📊 HTTP Status: 400 Bad Request")
+                        logger.error(f"📊 Reason: Invalid request format or parameters for {deployment}")
+                    elif "404" in error_str or "not found" in error_str:
+                        logger.error(f"📊 HTTP Status: 404 Not Found")
+                        logger.error(f"📊 Reason: Deployment '{deployment}' not found in Azure OpenAI")
+                    elif "401" in error_str or "unauthorized" in error_str:
+                        logger.error(f"📊 HTTP Status: 401 Unauthorized")
+                        logger.error(f"📊 Reason: Invalid API key or authentication failed")
+                    elif "500" in error_str or "internal server error" in error_str:
+                        logger.error(f"📊 HTTP Status: 500 Internal Server Error")
+                        logger.error(f"📊 Reason: Azure OpenAI server error")
+                    else:
+                        logger.error(f"📊 HTTP Status: Unknown")
+                        logger.error(f"📊 Reason: {str(e)[:200]}")
+                    
+                    logger.error(f"=" * 80)
+                    
+                    # Track failed attempt
+                    error_message = str(e)[:200] if str(e) else "Unknown error"
+                    if "400" in error_str or "bad request" in error_str:
+                        model_attempts.append({
+                            "model": deployment,
+                            "status": "failed",
+                            "message": f"Bad Request (400) - {error_message}"
+                        })
+                    elif "404" in error_str or "not found" in error_str:
+                        model_attempts.append({
+                            "model": deployment,
+                            "status": "failed",
+                            "message": f"Not Found (404) - Deployment not found"
+                        })
+                    elif "401" in error_str or "unauthorized" in error_str:
+                        model_attempts.append({
+                            "model": deployment,
+                            "status": "failed",
+                            "message": f"Unauthorized (401) - Authentication failed"
+                        })
+                    elif "500" in error_str or "internal server error" in error_str:
+                        model_attempts.append({
+                            "model": deployment,
+                            "status": "failed",
+                            "message": f"Server Error (500) - {error_message}"
+                        })
+                    else:
+                        model_attempts.append({
+                            "model": deployment,
+                            "status": "failed",
+                            "message": f"Error - {error_message}"
+                        })
+                    
+                    # Non-rate-limit error - IMMEDIATELY cancel and try next deployment
+                    # Don't retry - just move to next model immediately
+                    logger.warning(f"🛑 Canceling {deployment} - NOT retrying. Moving to next model immediately...")
+                    break  # Break inner loop immediately - cancel any retries, try next model
         
         # If we get here, this deployment failed - try next one (if available)
         # CANCEL current model and wait 10 seconds before trying next model
@@ -1990,7 +1990,7 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
             logger.error(f"❌ All {len(deployments_to_try)} models exhausted - no more models to try")
             logger.error(f"❌ Last Error: {str(last_error)[:200] if last_error else 'Unknown'}")
             logger.error(f"=" * 80)
-                break
+            break
     
     # Fallback response if all models fail after all retries
     fallback_response = """{"status": "reject", "missing_elements": ["Unable to validate due to AI service error - please try again"], "safety_concerns": [], "analysis": "AI validation service temporarily unavailable. Please try again.", "word_count_analysis": "Unable to analyze due to service error", "content_quality": "Unable to assess due to service error"}"""
