@@ -2,11 +2,18 @@ from typing import Union, List, Dict, Any
 import logging
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import AzureOpenAI
+from openai import AzureOpenAI, RateLimitError
 import uuid
+import asyncio
+import base64
+import tempfile
+import json
+from datetime import datetime
+from database_schema import DatabaseManager
+from time import time
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +37,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Initialize database manager
+db_manager = DatabaseManager()
+
+# Rate Limiting Configuration
+class RateLimiter:
+    """Rate limiter to prevent hitting Azure OpenAI API rate limits"""
+    def __init__(self, max_concurrent: int = 3, min_delay: float = 0.5):
+        """
+        Args:
+            max_concurrent: Maximum number of concurrent requests
+            min_delay: Minimum delay between requests in seconds
+        """
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.min_delay = min_delay
+        self.last_request_time = 0
+        self.rate_limit_hits = 0
+        
+    async def acquire(self):
+        """Acquire rate limiter lock and enforce delay"""
+        await self.semaphore.acquire()
+        
+        # Enforce minimum delay between requests
+        current_time = time()
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.min_delay:
+            await asyncio.sleep(self.min_delay - time_since_last)
+        
+        self.last_request_time = time()
+    
+    def release(self):
+        """Release rate limiter lock"""
+        self.semaphore.release()
+    
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+    
+    def on_rate_limit_hit(self):
+        """Called when a rate limit error is detected"""
+        self.rate_limit_hits += 1
+        logger.warning(f"⚠️ Rate limit hit (#{self.rate_limit_hits}). Consider increasing delays or reducing concurrent requests.")
+
+# Global rate limiter instance
+rate_limiter = RateLimiter(max_concurrent=3, min_delay=0.8)  # 3 concurrent requests, 0.8s delay
+
+# Dynamic guidelines are now generated from client guardrails in the database
+# No hardcoded QUESTION_GUIDELINES needed
+
+# Q41 guidelines should come from frontend API - no hardcoding in backend
+# Frontend gets question 41 from main API and sends word count to validation API
+
 # Pydantic models
 class MessageRequest(BaseModel):
     thread_id: str
@@ -44,7 +105,23 @@ class MessageResponse(BaseModel):
 class ThreadResponse(BaseModel):
     success: bool
     thread_id: str
+
+class AnswerValidationRequest(BaseModel):
+    user_answer: str
+    question_guardrail: str = None  # Question-specific guardrail from frontend
+    q41_guardrail: str = None  # Q41 guardrail (word count) from frontend
+    ai_suggestion: str = None  # Optional: AI suggestion that user was asked to modify
+
+class AnswerValidationResponse(BaseModel):
+    status: str  # "approve", "reject", "review"
     message: str
+    analysis: str = ""  # Detailed AI analysis of the answer
+    suggested_answer: str = ""  # Suggested corrected answer from the model
+    missing_elements: List[str] = []
+    safety_concerns: List[str] = []
+    word_count: int
+    guidelines_checked: List[str] = []
+    modification_status: dict = {}  # Status of modifications if ai_suggestion was provided
 
 class ThreadMessagesResponse(BaseModel):
     success: bool
@@ -105,7 +182,7 @@ class AzureOpenAIService:
         self.client = None
         self._initialized = False
         self.conversations = {}  # Store conversations in memory
-        self.deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")  # Store deployment name
+        self.deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini")  # Store deployment name
     
     def _initialize_client(self):
         """Initialize the Azure OpenAI client"""
@@ -153,20 +230,31 @@ class AzureOpenAIService:
             })
             
             # Get response from Azure OpenAI
-            response = self.client.chat.completions.create(
-                model=self.deployment,
-                messages=self.conversations[thread_id],
-                max_tokens=6553,
-                temperature=0.7,
-                top_p=0.95,
-                frequency_penalty=0,
-                presence_penalty=0,
-                stop=None,
-                stream=False
-            )
-            
-            # Extract response content
-            response_content = response.choices[0].message.content
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.deployment,
+                    messages=self.conversations[thread_id],
+                    max_tokens=6553,
+                    temperature=0.7,
+                    top_p=0.95,
+                    frequency_penalty=0,
+                    presence_penalty=0,
+                    stop=None,
+                    stream=False
+                )
+                
+                # Extract response content
+                response_content = response.choices[0].message.content
+            except RateLimitError as e:
+                logger.error(f"❌ Rate limit error (429) in send_message: {str(e)}")
+                logger.warning("⚠️ Azure OpenAI rate limit exceeded. The request will be retried automatically by the SDK.")
+                raise  # Re-raise to let the caller handle retries
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                    logger.error(f"❌ Rate limit detected in send_message: {str(e)}")
+                    logger.warning("⚠️ Azure OpenAI rate limit exceeded. Consider reducing request frequency.")
+                raise  # Re-raise to let the caller handle it
             
             # Add assistant response to conversation
             self.conversations[thread_id].append({
@@ -734,6 +822,669 @@ def initialize_ai_prescreener():
 # Initialize on startup
 initialize_ai_prescreener()
 
+# Answer validation functions
+def check_meaningful_modification(original: str, current: str) -> dict:
+    """
+    Check if user made meaningful modifications to AI suggestion.
+    Returns validation result with detailed feedback.
+    
+    Requirements for meaningful modification:
+    - At least 10 characters different (excluding whitespace)
+    - At least 2 new/changed meaningful words (3+ chars)
+    - At least 15% content change
+    
+    This prevents users from just adding random text or whitespace.
+    """
+    import re
+    
+    original_trim = original.strip() if original else ""
+    current_trim = current.strip() if current else ""
+    
+    # If exactly same, no modification
+    if original_trim == current_trim:
+        return {
+            "is_valid": False,
+            "reason": "Please make changes to the AI suggestion",
+            "change_percent": 0,
+            "char_diff": 0,
+            "new_words_count": 0,
+            "needs_more_changes": True
+        }
+    
+    # Normalize text for comparison (remove extra whitespace, lowercase)
+    def normalize_text(text: str) -> str:
+        return re.sub(r'\s+', ' ', text.strip().lower())
+    
+    original_norm = normalize_text(original_trim)
+    current_norm = normalize_text(current_trim)
+    
+    # Calculate character difference (excluding whitespace)
+    original_chars = re.sub(r'\s', '', original_norm)
+    current_chars = re.sub(r'\s', '', current_norm)
+    char_diff = abs(len(current_chars) - len(original_chars))
+    
+    # Count words
+    original_words = [w for w in original_norm.split() if len(w) > 0]
+    current_words = [w for w in current_norm.split() if len(w) > 0]
+    
+    # Find new words (words in current that aren't in original)
+    new_words = [w for w in current_words if w not in original_words]
+    
+    # Calculate change percentage
+    total_original_words = len(original_words) if original_words else 1
+    change_percent = ((abs(len(current_words) - len(original_words)) + len(new_words)) / total_original_words) * 100
+    
+    # Requirements for meaningful modification
+    meaningful_new_words = [w for w in new_words if len(w) >= 3]
+    has_enough_new_words = len(meaningful_new_words) >= 2
+    has_enough_char_diff = char_diff >= 10
+    has_enough_change_percent = change_percent >= 15
+    
+    # Determine if modification is valid
+    is_valid = has_enough_new_words and has_enough_char_diff and has_enough_change_percent
+    
+    # Provide specific guidance
+    if is_valid:
+        reason = f"Great! You've made good changes ({int(change_percent)}% modified)"
+    elif not has_enough_new_words:
+        reason = f"Add at least 2 more words or make more changes. You've added {len(meaningful_new_words)} new word(s)."
+    elif not has_enough_char_diff:
+        reason = f"Make more significant changes. You've changed {char_diff} characters. Try adding more details."
+    elif not has_enough_change_percent:
+        reason = f"Make more changes. You've modified {int(change_percent)}% of the text. Add more details or examples."
+    else:
+        reason = "Please make more meaningful changes"
+    
+    return {
+        "is_valid": is_valid,
+        "reason": reason,
+        "change_percent": int(change_percent),
+        "char_diff": char_diff,
+        "new_words_count": len(meaningful_new_words),
+        "needs_more_changes": not is_valid
+    }
+
+async def generate_suggested_answer(user_answer: str, question_guardrail: str, q41_guardrail: str, missing_elements: list, analysis: str) -> str:
+    """
+    Generate a suggested corrected answer when the AI doesn't provide one.
+    """
+    logger.info("🎯 Generating suggested answer as fallback...")
+    
+    try:
+        prompt = f"""Generate a complete, corrected version of this answer that meets ALL requirements.
+
+⚠️ CRITICAL RULE: The suggestion must be DERIVATIVE of what the caregiver actually entered, but COMPLETE and ready to use.
+- Start with EXACTLY what the user wrote
+- ONLY expand and refine the user's actual words
+- Complete all sentences fully - NEVER leave blanks like "engaged in ." or "symptoms such as ."
+- Use generic descriptive words to complete incomplete thoughts
+- NEVER invent specific facts, temperatures, exact times, or specific activities not in the user's original answer
+- Fix grammar, add professional structure, meet word count ({q41_guardrail})
+- Preserve ALL facts and details from the user's answer
+- The answer MUST be complete and grammatically correct - no placeholders, no blanks
+
+Original Answer: "{user_answer}"
+Question Requirements: "{question_guardrail}"
+Length Requirement: "{q41_guardrail}"
+Missing Elements: {missing_elements}
+What to Add: {analysis}
+
+⚠️ CRITICAL RULE - AI COLLABORATION:
+The suggestion must be DERIVATIVE of what the caregiver actually entered, but COMPLETE.
+✅ MUST DO:
+- Start with EXACTLY what the user wrote (preserve their words)
+- ONLY expand, refine, and fix grammar of the user's actual words
+- Complete all sentences fully - NEVER leave blanks like "engaged in ." or "symptoms such as ."
+- Use generic descriptive words to complete incomplete thoughts (e.g., "engaged in activities", "displayed various symptoms")
+- NEVER invent specific facts, temperatures, exact times, or specific activities not in the user's original answer
+- Fix grammar, add professional structure, meet word count ({q41_guardrail})
+- Preserve ALL facts, events, and details the user mentioned
+- The answer MUST be complete and grammatically correct - no placeholders, no blanks
+
+❌ NEVER DO:
+- Leave blanks, placeholders, or incomplete sentences like "engaged in ." or "symptoms such as ."
+- Create templates with empty slots like "[specific activity]" or incomplete phrases
+- Invent specific facts (temperatures like "37.8°C", exact times like "2:00 PM", specific activities the user didn't mention)
+- Create generic boilerplate that doesn't reflect what the user actually wrote
+- Use incomplete phrases that require the user to add details
+
+✅ COMPLETION EXAMPLES:
+- "client engaged in" → Complete to "The client engaged in various activities throughout the day"
+- "symptoms such as" → Complete to "The client displayed symptoms such as fatigue and discomfort"
+- "occurred at" → Complete to "The incident occurred during the afternoon period"
+- Use generic professional language to complete thoughts while respecting what the user actually said
+
+🎯 PRINCIPLE: The suggestion should be COMPLETE and ready to use immediately - what the user would have written with more time and proper format. Complete incomplete thoughts with generic language, but don't invent specific facts.
+
+Return ONLY a single, complete answer (no explanations, no extra text, no blanks, no placeholders)
+MUST meet the length requirement: {q41_guardrail}
+MUST be grammatically complete and ready to use immediately"""
+        
+        response = await call_ai_model(prompt)
+        suggested = response.strip().strip('"').strip("'")
+        logger.info(f"✅ Generated suggested answer: {suggested[:100]}...")
+        return suggested
+    except Exception as e:
+        logger.error(f"❌ Failed to generate suggested answer: {e}")
+        return ""
+
+async def validate_answer_with_ai(user_answer: str, question_guardrail: str = None, q41_guardrail: str = None) -> Dict[str, Any]:
+    """
+    Validate answer using AI model with dynamic guardrails - NO HARDCODED RULES
+    
+    This function uses AI to intelligently validate the user's answer against:
+    1. Question-specific guardrails (what the question requires)
+    2. Q41 guardrails (word count and general requirements)
+    
+    Returns dynamic validation results based on actual content analysis.
+    """
+    logger.info("=" * 60)
+    logger.info("🤖 AI-BASED ANSWER VALIDATION STARTING")
+    logger.info("=" * 60)
+    
+    logger.info(f"📝 USER ANSWER: '{user_answer}'")
+    logger.info(f"📋 QUESTION GUARDRAIL: '{question_guardrail}'")
+    logger.info(f"📋 Q41 GUARDRAIL: '{q41_guardrail}'")
+    
+    # Basic word count for logging
+    word_count = len(user_answer.split())
+    logger.info(f"📊 WORD COUNT: {word_count}")
+    
+    # Validate inputs
+    if not question_guardrail:
+        logger.error("❌ QUESTION GUARDRAIL MISSING")
+        raise ValueError("Question guardrail must be provided from frontend")
+    
+    if not q41_guardrail:
+        logger.error("❌ Q41 GUARDRAIL MISSING")
+        raise ValueError("Q41 guardrail must be provided from frontend")
+    
+    try:
+        # Create AI prompt for validation
+        validation_prompt = f"""
+You are a helpful guide helping a care worker complete their shift notes. Be supportive, clear, and specific. Help them improve their answer, don't criticize it.
+
+⚠️ CRITICAL: Be REASONABLE, not PERFECTIONIST. Approve answers that meet basic requirements - don't look for perfection!
+
+USER'S ANSWER:
+"{user_answer}"
+
+QUESTION: {question_guardrail.split('.')[0] if '.' in question_guardrail else question_guardrail}
+
+QUESTION REQUIREMENTS:
+"{question_guardrail}"
+
+LENGTH REQUIREMENT:
+"{q41_guardrail}"
+
+🎯 APPROVAL PRIORITY: If the answer meets basic requirements, APPROVE IT immediately. Don't look for ways to reject it!
+
+Analyze the answer and return ONLY valid JSON (no other text before or after).
+
+CRITICAL REQUIREMENT: If status is "reject" or "review", you MUST include a complete "suggested_answer". This field CANNOT be empty or omitted.
+
+Return this exact JSON structure:
+{{
+    "status": "approve" or "reject" or "review",
+    "missing_elements": ["specific, action-oriented suggestions as list"],
+    "safety_concerns": ["any safety issues as list"],
+    "analysis": "helpful, encouraging guidance (friendly tone)",
+    "word_count_analysis": "word count assessment",
+    "content_quality": "quality and completeness assessment",
+    "suggested_answer": "FOR REJECT/REVIEW: A complete, rewritten answer that meets ALL requirements. FOR APPROVE: Can be empty string."
+}}
+
+VALIDATION RULES:
+1. "approve" - Answer meets basic requirements (minimum word count, answers the question, objective tone)
+   ✅ ALWAYS APPROVE if answer has ALL of these:
+      - Minimum word count met ({q41_guardrail})
+      - Addresses the question topic clearly
+      - Uses objective, professional language (not personal opinions like "I think", "I enjoyed")
+      - Contains relevant information about the client/event/situation
+      - Grammar is readable (minor errors are OK)
+ 
+   ⚠️ CRITICAL: If an answer meets the 5 criteria above, APPROVE IT - don't look for perfection!
+   ⚠️ DO NOT REJECT because answer "could include more specific observations" - that's nice-to-have, not required!
+   ⚠️ DO NOT REJECT because answer "could mention specific times" - that's optional detail!
+   ⚠️ DO NOT REJECT because answer "could be more detailed" - if it meets basic requirements, approve!
+   
+2. "reject" - Answer is missing CRITICAL REQUIRED elements
+   ❌ REJECT ONLY if answer is missing MULTIPLE critical elements:
+      - Significantly below minimum word count (less than 75% of requirement)
+      - Completely unrelated to the question topic
+      - Contains personal opinions that replace objective facts (e.g., "I enjoyed" instead of "client participated")
+      - Contains grammar errors that make it completely unreadable
+      - Completely lacks any relevant information about the client/event
+   
+   ✅ DO NOT REJECT if:
+      - Answer meets minimum word count (even if barely)
+      - Answer addresses the question (even if could be more detailed)
+      - Minor grammar issues that don't affect readability
+      - Missing "optional" details like specific times, mood observations, etc.
+      - Answer is "good but could be better" - if it meets requirements, approve it!
+   
+3. "review" - Safety/health concern detected (triggers incident form)
+
+REVIEW RULES (MANDATORY):
+- Set "status": "review" and include a non-empty "safety_concerns" list when the answer indicates any potential safety/health incident, including but not limited to:
+  • fall, slip, trip, head injury, loss of consciousness, fainting
+  • injury, bleeding, burn, fracture, choking, seizure
+  • medication error, missed dose that caused risk, overdose
+  • abuse, neglect, elopement/wandering, missing person
+  • aggression/violence requiring intervention, restraint, property damage
+  • police/EMS/911 called, ambulance, ER/hospital visit
+  • any serious hazard or emergency requiring escalation
+
+- When setting review:
+  • Populate "safety_concerns" with concise labels (e.g., ["fall"], ["seizure"], ["medication_error"], ["911_called"]).
+  • Keep labels generic and professional; do NOT fabricate details beyond the user’s text.
+  • Still provide a complete "suggested_answer" that is safe and professional.
+
+- Do NOT set "review" for ordinary illness or minor discomfort (e.g., “client was sick” or “fever”) unless the text clearly implies urgent risk or escalation (e.g., unconscious, severe bleeding, seizure, 911/ER, or similar).
+
+CRITICAL - TONE AND MESSAGING (MUST FOLLOW):
+- ALWAYS write in SECOND PERSON: Use "Your answer" or "You need to" - NEVER "The user's answer" or "The answer"
+- BE HELPFUL, NOT CRITICAL: Frame as "Add more detail about..." not "Missing..." or "Does not meet..."
+- BE SPECIFIC: Tell them exactly what to add (e.g., "Include at least one activity" not "Answer incomplete")
+- BE ENCOURAGING: Guide them forward - don't point out mistakes like a teacher
+- NO CRITICAL WORDS: Never use "wrong", "inadequate", "failed", "poor quality", "nonsensical", "unprofessional"
+- BE CLEAR: Older users need simple, direct instructions - keep it friendly
+- NEVER criticize: If answer is bad, guide them on how to fix it - don't describe how bad it is
+
+MISSING_ELEMENTS FORMAT:
+Write as specific, direct action items. Be SHORT and CLEAR - tell them exactly what to add:
+- "Include at least one activity the client did today"
+- "Add social interaction details"
+- "Include what time the event happened"
+- "Add details about how the client participated"
+- If too short: "Add more detail - you need {q41_guardrail}"
+- If grammar: "Fix spelling errors"
+- If personal opinions: "Remove personal thoughts (like 'I enjoyed') - use facts only"
+- NOT generic: "Objective description missing" or "Insufficient detail"
+
+ANALYSIS FORMAT (MANDATORY):
+Write DIRECTLY to the user in second person. Be SHORT, HELPFUL, and SPECIFIC (1 sentence max):
+✅ GOOD examples:
+- "Add more detail about what the client did today. You need {q41_guardrail}."
+- "Describe the event with facts instead of personal thoughts (like 'I had pleasure')."
+- "Include what time the event happened and what activities took place."
+
+❌ NEVER use these phrases:
+- "The user's answer is..." 
+- "The answer does not meet..."
+- "The answer is vague/nonsensical/incomplete..."
+- "The response lacks..."
+- "It fails to..."
+- "The answer does not provide..."
+
+✅ ALWAYS start with: "Your answer" or "Add" or "Include" - guide them forward, don't criticize backward
+- Focus on what to ADD, not what's WRONG
+
+SUGGESTED_ANSWER (CRITICAL RULES - AI COLLABORATION):
+⚠️ VERY IMPORTANT: The suggestion must be DERIVATIVE of what the caregiver actually entered.
+✅ MUST DO:
+- Start with EXACTLY what the user wrote (word-for-word if it makes sense)
+- ONLY expand and refine the user's actual words
+- Fix grammar, add structure, use professional language
+- Meet the minimum word count requirement ({q41_guardrail})
+- Preserve ALL facts, events, and details the user mentioned
+- Complete sentences completely - NEVER leave blanks like "engaged in ." or "symptoms such as ."
+- Use generic descriptive language to complete thoughts (e.g., "engaged in activities" not "engaged in .")
+- If user says "client feel fever" → Expand to: "The client reported feeling feverish today. Appropriate actions were taken to monitor their condition."
+- If user says "event was good" → Expand to: "The event [preserve user's description]. The client participated actively and appeared engaged throughout."
+- If user's answer is very brief: Complete it with generic professional language that makes logical sense
+- REMOVE any meta-instructions like "Please include..." or "Add more details..." from suggested answers
+- The suggested answer MUST be complete and grammatically correct - no blanks, no placeholders, no incomplete sentences
+
+❌ NEVER DO:
+- Leave blanks or placeholders like "engaged in ." or "symptoms such as ."
+- Use incomplete sentences that require the user to fill in details
+- Create templates with empty slots like "[specific activity]"
+- Invent specific facts (temperatures, exact times, specific activities) not in user's answer
+- Include instruction phrases like "Please add..." or "Include more..." in the suggested answer itself
+
+✅ DO:
+- Complete all sentences with appropriate generic language
+- Use phrases like "activities", "interactions", "observations" to complete incomplete thoughts
+- Make the answer ready to use immediately without any blanks or placeholders
+
+🎯 PRINCIPLE: The suggestion should be a COMPLETE, FINAL answer ready to use - what the user would have written if they had more time. Complete incomplete thoughts with generic professional language, but don't invent specific facts.
+
+CRITICAL - BE REASONABLE WITH VALIDATION (VERY IMPORTANT):
+⚠️ APPROVE answers that meet basic requirements - don't look for perfection!
+⚠️ If word count is met + question is answered + objective tone = APPROVE (even if it could be more detailed)
+⚠️ "Could include more specific observations" = NOT A REASON TO REJECT (that's optional nice-to-have)
+⚠️ "Could mention specific times" = NOT A REASON TO REJECT (that's optional detail)
+⚠️ "Could be more detailed" = NOT A REASON TO REJECT if basic requirements are met
+⚠️ ONLY REJECT if answer is actually missing MULTIPLE critical required elements
+⚠️ When in doubt, APPROVE - it's better to accept a reasonable answer than reject unnecessarily
+
+APPROVAL DECISION TREE (FOLLOW STRICTLY):
+Step 1: Does answer meet minimum word count ({q41_guardrail})?
+  - YES → Go to Step 2
+  - NO (significantly below, less than 75%) → REJECT for word count only
+  
+Step 2: Does answer address the question topic?
+  - YES → Go to Step 3
+  - NO (completely unrelated) → REJECT for off-topic only
+  
+Step 3: Is answer objective (not personal opinions like "I enjoyed", "it was good")?
+  - YES → Go to Step 4
+  - NO (contains personal opinions instead of facts) → REJECT for personal opinions only
+  
+Step 4: Does answer contain relevant information about client/event/situation?
+  - YES → ⚠️ APPROVE IMMEDIATELY! Stop here! Don't check for more details!
+  - NO (completely empty of information) → REJECT for lack of content only
+
+⚠️ CRITICAL RULE: If you reach Step 4 and answer contains relevant information, you MUST APPROVE it.
+❌ DO NOT check for:
+   - "Could include more specific observations" → That's optional, not required!
+   - "Could mention specific times" → That's optional detail!
+   - "Could be more detailed" → If basic requirements met, that's enough!
+   - "Missing mood observations" → Optional nice-to-have!
+
+✅ When in doubt between APPROVE and REJECT → Choose APPROVE!
+"""
+
+        logger.info("🤖 Sending validation request to AI model...")
+        
+        # Call AI model for validation
+        response = await call_ai_model(validation_prompt)
+        
+        logger.info("🤖 AI Response received:")
+        logger.info(f"📝 Full Response: {response}")
+        
+        # Parse AI response
+        try:
+            # Extract JSON from AI response
+            import json
+            import re
+            
+            # Find JSON in the response
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                validation_data = json.loads(json_match.group())
+                # Check if suggested_answer is missing and log it
+                if "suggested_answer" not in validation_data:
+                    logger.warning("⚠️ AI did not include 'suggested_answer' field in response")
+                    validation_data["suggested_answer"] = ""
+                elif not validation_data.get("suggested_answer"):
+                    logger.warning("⚠️ AI provided empty 'suggested_answer' field")
+            else:
+                # Fallback if no JSON found
+                logger.warning("⚠️ No JSON found in AI response, using fallback")
+                validation_data = {
+                    "status": "reject",
+                    "missing_elements": ["Unable to validate - please try again"],
+                    "safety_concerns": [],
+                    "analysis": "AI validation failed",
+                    "word_count_analysis": "Unable to analyze",
+                    "content_quality": "Unable to assess",
+                    "suggested_answer": ""
+                }
+            
+            logger.info(f"✅ AI Validation Result: {validation_data}")
+            logger.info(f"📝 Suggested Answer from AI: '{validation_data.get('suggested_answer', 'NOT PROVIDED')}'")
+            
+            # Post-process analysis to ensure second-person tone
+            if "analysis" in validation_data and validation_data["analysis"]:
+                analysis = validation_data["analysis"]
+                # Replace third-person references with second-person
+                analysis = re.sub(r'\bThe user\'s answer\b', 'Your answer', analysis)
+                analysis = re.sub(r'\bThe answer\b', 'Your answer', analysis)
+                analysis = re.sub(r'\bThe response\b', 'Your answer', analysis)
+                analysis = re.sub(r'\bIt fails to\b', 'Add', analysis)
+                analysis = re.sub(r'\bIt does not\b', 'Your answer needs to', analysis)
+                analysis = re.sub(r'\bIt lacks\b', 'Add', analysis)
+                analysis = re.sub(r'\bdoes not meet\b', 'needs to meet', analysis)
+                analysis = re.sub(r'\bdoes not provide\b', 'needs to include', analysis)
+                analysis = re.sub(r'\bdoes not adhere to\b', 'should follow', analysis)
+                analysis = re.sub(r'\bdoes not address\b', 'should address', analysis)
+                # Remove critical language
+                analysis = re.sub(r'\bis nonsensical\b', 'needs meaningful content', analysis, flags=re.IGNORECASE)
+                analysis = re.sub(r'\bis vague\b', 'needs more detail', analysis, flags=re.IGNORECASE)
+                analysis = re.sub(r'\bis incomplete\b', 'needs more detail', analysis, flags=re.IGNORECASE)
+                analysis = re.sub(r'\bis unprofessional\b', 'needs professional language', analysis, flags=re.IGNORECASE)
+                validation_data["analysis"] = analysis
+                logger.info(f"📝 Post-processed analysis: {analysis}")
+            
+            # Get suggested answer from AI response (if provided)
+            suggested_answer = validation_data.get("suggested_answer", "")
+            
+            # Clean up suggested answer: Remove instruction phrases and fix incomplete sentences
+            if suggested_answer:
+                import re
+                # Remove common instruction phrases at the end or beginning
+                instruction_patterns = [
+                    r'Please include more details?.*?\.\s*$',
+                    r'Please add.*?\.\s*$',
+                    r'Include more.*?\.\s*$',
+                    r'Add more.*?\.\s*$',
+                    r'Please.*?details.*?\.\s*$',
+                    r'Please.*?observations.*?\.\s*$',
+                    r'Please.*?specific.*?\.\s*$',
+                    r'Include.*?observations.*?\.\s*$',
+                    r'Add.*?observations.*?\.\s*$',
+                    r'if applicable\.\s*$',
+                    r'where applicable\.\s*$',
+                    r'Include more.*?if applicable\.\s*$',
+                    r'Add.*?where applicable\.\s*$',
+                    r'\[specific.*?\]',  # Remove template placeholders like [specific activity, e.g., ...]
+                    r'\[.*?e\.g\..*?\]',  # Remove any [text, e.g., more text] patterns
+                    r'e\.g\.[^.]*\.',  # Remove "e.g., ..." phrases
+                    r'\[.*?\]',  # Remove any remaining square bracket patterns (template placeholders)
+                ]
+                for pattern in instruction_patterns:
+                    suggested_answer = re.sub(pattern, '', suggested_answer, flags=re.IGNORECASE)
+                
+                # Fix incomplete sentences with blanks (e.g., "symptoms such as ." or "occurred at ,")
+                suggested_answer = re.sub(r'\bsuch as\s+\.', 'such as various symptoms', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\boccurred at\s+,\s*', 'occurred during the day,', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\bengaged in\s+\.', 'engaged in various activities', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\bparticipated in\s+\.', 'participated in activities', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\bat\s+,\s*', 'during the period,', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\bsuch as\s*$', 'such as various symptoms', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\band\s+\.\s*', 'and other activities.', suggested_answer, flags=re.IGNORECASE)
+                suggested_answer = re.sub(r'\s+\.\s+', '. ', suggested_answer)  # Fix "word . nextword" to "word. nextword"
+                suggested_answer = re.sub(r',\s*\.', '.', suggested_answer)  # Fix ", ." to "."
+                suggested_answer = re.sub(r'\s+,\s*$', '.', suggested_answer)  # Fix trailing ", " to "."
+                
+                # Clean up any extra whitespace and trailing punctuation
+                suggested_answer = re.sub(r'\s+', ' ', suggested_answer).strip()
+                suggested_answer = re.sub(r'\s*\.\s*\.', '.', suggested_answer)  # Fix double periods
+                logger.info(f"🧹 Cleaned suggested answer (removed instruction phrases): '{suggested_answer[:100]}...'")
+            
+            if not suggested_answer and validation_data.get("status") in ["reject", "review"]:
+                logger.warning("⚠️ AI did not provide suggested_answer, generating one...")
+                # Generate suggested answer as a separate AI call
+                suggested_answer = await generate_suggested_answer(
+                    user_answer=user_answer,
+                    question_guardrail=question_guardrail,
+                    q41_guardrail=q41_guardrail,
+                    missing_elements=validation_data.get("missing_elements", []),
+                    analysis=validation_data.get("analysis", "")
+                )
+            
+            # Ensure required fields exist
+            result = {
+                "word_count": word_count,
+                "missing_elements": validation_data.get("missing_elements", []),
+                "safety_concerns": validation_data.get("safety_concerns", []),
+                "guidelines_checked": [
+                    "Question-specific requirements (AI analyzed)",
+                    "Q41 general requirements (AI analyzed)"
+                ],
+                "ai_analysis": validation_data.get("analysis", ""),
+                "word_count_analysis": validation_data.get("word_count_analysis", ""),
+                "content_quality": validation_data.get("content_quality", ""),
+                "suggested_answer": suggested_answer
+            }
+            
+            logger.info("=" * 60)
+            logger.info("✅ AI VALIDATION COMPLETE")
+            logger.info("=" * 60)
+            logger.info(f"📝 FINAL SUGGESTED ANSWER: '{suggested_answer}'")
+            logger.info(f"📝 SUGGESTED ANSWER LENGTH: {len(suggested_answer)}")
+            
+            return result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Failed to parse AI response as JSON: {e}")
+            logger.error(f"❌ AI Response: {response}")
+            return {
+                "word_count": word_count,
+                "missing_elements": ["AI validation failed - please try again"],
+                "safety_concerns": [],
+                "guidelines_checked": ["AI validation failed"],
+                "ai_analysis": "Failed to parse AI response",
+                "word_count_analysis": "Unable to analyze",
+                "content_quality": "Unable to assess"
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ AI VALIDATION ERROR: {str(e)}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        import traceback
+        logger.error(f"❌ Traceback: {traceback.format_exc()}")
+        
+        # Fallback validation
+        return {
+            "word_count": word_count,
+            "missing_elements": ["Validation system error - please try again"],
+            "safety_concerns": [],
+            "guidelines_checked": ["System error occurred"],
+            "ai_analysis": f"Validation error: {str(e)}",
+            "word_count_analysis": "Unable to analyze due to error",
+            "content_quality": "Unable to assess due to error"
+        }
+
+async def call_ai_model(prompt: str, max_retries: int = 3) -> str:
+    """
+    Call Azure OpenAI model for validation analysis with rate limiting
+    
+    Args:
+        prompt: The prompt to send to the AI model
+        max_retries: Maximum number of retries on rate limit errors
+    """
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            # Use rate limiter to prevent hitting rate limits
+            async with rate_limiter:
+                logger.info(f"🤖 Calling Azure OpenAI for validation... (attempt {retry_count + 1}/{max_retries + 1})")
+                
+                # Use your existing Azure OpenAI service with proper parameters
+                # Create a thread for this validation request
+                thread_id = "validation-thread"
+                response = azure_service.send_message(thread_id, prompt)
+                
+                logger.info("🤖 Azure OpenAI response received")
+                return response
+                
+        except RateLimitError as e:
+            retry_count += 1
+            last_error = e
+            rate_limiter.on_rate_limit_hit()
+            
+            if retry_count <= max_retries:
+                # Exponential backoff: wait longer with each retry
+                wait_time = min(2 ** retry_count, 30)  # Cap at 30 seconds
+                logger.warning(f"⏳ Rate limit hit (429). Retrying in {wait_time} seconds... (attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"❌ Rate limit exceeded after {max_retries} retries")
+                raise
+        
+        except Exception as e:
+            last_error = e
+            logger.error(f"❌ AZURE OPENAI CALL ERROR: {str(e)}")
+            logger.error(f"❌ Error type: {type(e).__name__}")
+            
+            # Check if it's a rate limit error by status code
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                retry_count += 1
+                rate_limiter.on_rate_limit_hit()
+                
+                if retry_count <= max_retries:
+                    wait_time = min(2 ** retry_count, 30)
+                    logger.warning(f"⏳ Rate limit detected. Retrying in {wait_time} seconds... (attempt {retry_count}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    continue
+            
+            # Non-rate-limit errors: return fallback after retries
+            if retry_count >= max_retries:
+                break
+            retry_count += 1
+    
+    # Fallback response if AI fails after all retries
+    fallback_response = """{"status": "reject", "missing_elements": ["Unable to validate due to AI service error - please try again"], "safety_concerns": [], "analysis": "AI validation service temporarily unavailable. Please try again.", "word_count_analysis": "Unable to analyze due to service error", "content_quality": "Unable to assess due to service error"}"""
+    
+    logger.warning(f"⚠️ Using fallback response due to AI service error (after {retry_count} attempts)")
+    if last_error:
+        logger.warning(f"⚠️ Last error: {str(last_error)}")
+    
+    return fallback_response
+
+def determine_response_status(validation_result: Dict[str, Any]) -> str:
+    """
+    Determine if response should be approve, reject, or review
+    CRITICAL: Safety concerns ALWAYS trigger REVIEW, never approve
+    """
+    # CRITICAL: If safety concerns found, ALWAYS trigger REVIEW (never approve)
+    safety_concerns = validation_result.get("safety_concerns", [])
+    if safety_concerns and len(safety_concerns) > 0:
+        logger.warning(f"⚠️ Safety concerns detected - forcing REVIEW status (never approve): {safety_concerns}")
+        return "review"
+    
+    # If missing elements found, trigger REJECT
+    if validation_result.get("missing_elements"):
+        return "reject"
+    
+    # Otherwise, APPROVE
+    return "approve"
+
+def generate_ai_response_message(status: str, validation_result: Dict[str, Any]) -> str:
+    """
+    Generate user-friendly response message using AI analysis
+    """
+    ai_analysis = validation_result.get("ai_analysis", "")
+    missing_elements = validation_result.get("missing_elements", [])
+    safety_concerns = validation_result.get("safety_concerns", [])
+    
+    if status == "approve":
+        return "✅ Perfect! Your answer has all the details needed. You're all set to continue!"
+    
+    elif status == "reject":
+        if missing_elements:
+            elements_text = "\n".join([f"• {element}" for element in missing_elements])
+            return f"💡 Add a bit more detail:\n\n{elements_text}\n\n{ai_analysis}"
+        else:
+            return f"💡 {ai_analysis}"
+    
+    elif status == "review":
+        if safety_concerns:
+            concerns_text = "\n".join([f"• {concern}" for concern in safety_concerns])
+            return f"🚨 Safety Review Required: {concerns_text}\n\nAn Incident Form will open automatically.\n\n{ai_analysis}"
+        else:
+            return f"🚨 Safety Review Required: {ai_analysis}\n\nAn Incident Form will open automatically."
+    
+    else:
+        return f"⚠️ Validation completed: {ai_analysis}"
+
+# Q41 guidelines endpoint removed - frontend should get question 41 from main API
+# and send word count guidelines to validation API
+
+# Question guidelines endpoint removed - frontend should get question guidelines from main API
+# and send them to validation API along with Q41 guidelines
+
+# Pydantic model for guidelines request
+class GuidelinesRequest(BaseModel):
+    question_id: str
+    client_id: str = "default"
+    context: Dict[str, Any] = {}
 # Existing endpoints
 @app.get("/")
 def read_root():
@@ -983,6 +1734,91 @@ async def speech_to_text(request: dict):
     except Exception as e:
         logger.error(f"❌ SPEECH-TO-TEXT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in speech-to-text: {str(e)}")
+
+@app.post("/speech-to-text-streaming")
+async def speech_to_text_streaming(request: dict):
+    """
+    Convert speech audio to text with streaming support for real-time experience
+    
+    Accepts base64 encoded audio chunks and returns transcribed text
+    Optimized for shorter audio segments for better real-time feel
+    """
+    import base64
+    import tempfile
+    import os
+    
+    try:
+        audio_data = request.get("audio_data")
+        audio_format = request.get("format", "m4a")
+        chunk_id = request.get("chunk_id", 0)
+        
+        if not audio_data:
+            raise HTTPException(status_code=400, detail="No audio data provided")
+        
+        logger.info(f"🎤 STREAMING SPEECH-TO-TEXT - Chunk {chunk_id} ({len(audio_data)} bytes base64)")
+        
+        # Decode base64 audio
+        audio_bytes = base64.b64decode(audio_data)
+        logger.info(f"🎤 Decoded audio chunk: {len(audio_bytes)} bytes")
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(suffix=f"_chunk_{chunk_id}.{audio_format}", delete=False) as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_audio_path = temp_audio.name
+            logger.info(f"🎤 Saved chunk to temp file: {temp_audio_path}")
+        
+        try:
+            # Use Azure OpenAI for Whisper (same credentials as GPT-4)
+            whisper_deployment = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
+            whisper_endpoint = os.getenv("AZURE_WHISPER_ENDPOINT", "https://hakeem-4411-resource.cognitiveservices.azure.com/openai/deployments/whisper/audio/transcriptions")
+            whisper_key = os.getenv("AZURE_WHISPER_KEY", os.getenv("AZURE_OPENAI_KEY"))
+            whisper_api_version = os.getenv("AZURE_WHISPER_API_VERSION", "2024-06-01")
+            
+            # Create Azure client for Whisper
+            whisper_client = AzureOpenAI(
+                api_key=whisper_key,
+                api_version=whisper_api_version,
+                azure_endpoint="https://hakeem-4411-resource.cognitiveservices.azure.com/"
+            )
+            
+            # Use Azure Cognitive Services Whisper
+            with open(temp_audio_path, "rb") as audio_file:
+                transcription = whisper_client.audio.transcriptions.create(
+                    model=whisper_deployment,
+                    file=audio_file,
+                    language="en"
+                )
+            
+            transcribed_text = transcription.text
+            logger.info(f"✅ STREAMING SPEECH-TO-TEXT - Chunk {chunk_id} Transcription: {transcribed_text}")
+            
+            # Clean up temp file
+            os.unlink(temp_audio_path)
+            
+            return {
+                "success": True,
+                "text": transcribed_text,
+                "chunk_id": chunk_id,
+                "language": "en",
+                "is_final": True  # For now, treat each chunk as final
+            }
+            
+        except Exception as whisper_error:
+            logger.error(f"❌ Streaming Whisper API error: {str(whisper_error)}")
+            # Clean up temp file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+            
+            return {
+                "success": False,
+                "text": "",
+                "chunk_id": chunk_id,
+                "error": "Speech-to-text service temporarily unavailable"
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ STREAMING SPEECH-TO-TEXT ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error in streaming speech-to-text: {str(e)}")
 
 @app.post("/ai-prescreener/analyze-shift")
 async def analyze_shift_with_ai_prescreener(request: dict):
@@ -1481,3 +2317,280 @@ def extract_concepts_from_message(message: str) -> List[str]:
             concepts.append(keyword)
     
     return concepts
+
+# Answer validation API endpoint
+@app.post("/validate-answer", response_model=AnswerValidationResponse)
+async def validate_answer(request: AnswerValidationRequest):
+    """
+    Validate answer against question guidelines and Q41 universal guidelines
+    
+    Returns:
+    - approve: Answer meets all requirements
+    - reject: Answer missing required elements (shows what's missing)
+    - review: Safety concerns detected (triggers Incident Form)
+    """
+    try:
+        logger.info(f"🔍 Validating answer")
+        logger.info(f"📝 Answer: {request.user_answer[:100]}...")
+        logger.info(f"📋 Question Guardrail: {request.question_guardrail}")
+        logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail}")
+        
+        # Check if AI suggestion was provided and validate modifications
+        modification_status = {}
+        if request.ai_suggestion:
+            logger.info(f"🔍 AI suggestion provided, checking modifications...")
+            logger.info(f"📝 AI Suggestion: {request.ai_suggestion[:100]}...")
+            modification_status = check_meaningful_modification(request.ai_suggestion, request.user_answer)
+            logger.info(f"✅ Modification check: {modification_status}")
+        
+        logger.info(f"🔍 FULL REQUEST DATA:")
+        logger.info(f"   - user_answer: '{request.user_answer}'")
+        logger.info(f"   - question_guardrail: '{request.question_guardrail}'")
+        logger.info(f"   - q41_guardrail: '{request.q41_guardrail}'")
+        if request.ai_suggestion:
+            logger.info(f"   - ai_suggestion: '{request.ai_suggestion[:100]}...'")
+        
+        # Validate answer content using AI model with dynamic guardrails
+        validation_result = await validate_answer_with_ai(
+            request.user_answer,
+            request.question_guardrail,
+            request.q41_guardrail
+        )
+        
+        # CRITICAL: Always check safety concerns FIRST - they override everything
+        safety_concerns = validation_result.get("safety_concerns", [])
+        if safety_concerns and len(safety_concerns) > 0:
+            logger.warning(f"🚨 SAFETY CONCERNS DETECTED - Forcing REVIEW status (cannot be overridden)")
+            logger.warning(f"🚨 Safety concerns: {safety_concerns}")
+            status = "review"
+        elif modification_status and modification_status.get("needs_more_changes", False):
+            # If modification check failed, override status to reject with modification feedback
+            logger.info(f"🔄 Overriding status to 'reject' due to insufficient modifications")
+            status = "reject"
+            # Add modification requirement to missing elements
+            if "missing_elements" not in validation_result:
+                validation_result["missing_elements"] = []
+            validation_result["missing_elements"].insert(0, modification_status.get("reason", "Please make meaningful changes to the AI suggestion"))
+            validation_result["ai_analysis"] = modification_status.get("reason", "Please edit the AI suggestion and add your own observations or details.")
+        else:
+            # Determine response status normally
+            status = determine_response_status(validation_result)
+        
+        # Generate response message using AI analysis
+        message = generate_ai_response_message(status, validation_result)
+        
+        logger.info(f"✅ Validation result: {status}")
+        logger.info(f"📊 Word count: {validation_result['word_count']}")
+        logger.info(f"🔍 Guidelines checked: {validation_result['guidelines_checked']}")
+        
+        if validation_result['missing_elements']:
+            logger.info(f"❌ Missing elements: {validation_result['missing_elements']}")
+        
+        if validation_result['safety_concerns']:
+            logger.warning(f"⚠️ Safety concerns: {validation_result['safety_concerns']}")
+        
+        # Get suggested answer for response
+        suggested_answer_value = validation_result.get('suggested_answer', '')
+        logger.info(f"✅ Returning suggested_answer to frontend: '{suggested_answer_value}'")
+        logger.info(f"✅ Suggested answer length in response: {len(suggested_answer_value)}")
+        
+        response = AnswerValidationResponse(
+            status=status,
+            message=message,
+            analysis=validation_result.get('ai_analysis', message),  # Include AI analysis
+            suggested_answer=suggested_answer_value,  # Include suggested answer
+            missing_elements=validation_result['missing_elements'],
+            safety_concerns=validation_result['safety_concerns'],
+            word_count=validation_result['word_count'],
+            guidelines_checked=validation_result['guidelines_checked'],
+            modification_status=modification_status if request.ai_suggestion else {}  # Include modification status
+        )
+        
+        logger.info(f"✅ API Response built successfully with suggested_answer")
+        return response
+        
+    except Exception as e:
+        logger.error(f"❌ Error validating answer: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Error validating answer: {str(e)}"
+        )
+
+# Real-time WebSocket streaming using Azure GPT Realtime API
+@app.websocket("/ws/realtime-speech")
+async def websocket_realtime_speech(websocket: WebSocket):
+    """
+    Real-time WebSocket endpoint using Azure GPT Realtime API
+    Provides true real-time speech-to-text with low latency
+    """
+    await websocket.accept()
+    logger.info("🎤 WebSocket connection established for GPT Realtime API")
+    
+    # GPT Realtime API configuration
+    GPT_REALTIME_ENDPOINT = "https://hakeem-4411-resource.cognitiveservices.azure.com/openai/realtime"
+    GPT_REALTIME_KEY = "47oYsTR8tSAcu3BJqsXDg4zZXLOcO1fY0uxhkR5fghe2NFmJm6A6JQQJ99BGACHYHv6XJ3w3AAAAACOG5jxP"
+    GPT_REALTIME_API_VERSION = "2024-10-01-preview"
+    GPT_REALTIME_DEPLOYMENT = "gpt-realtime"
+    
+    # Send transcription metadata first (Azure Communication Services style)
+    await websocket.send_text(json.dumps({
+        "kind": "TranscriptionMetadata",
+        "transcriptionMetadata": {
+            "subscriptionId": "gpt-realtime-subscription",
+            "locale": "en-US",
+            "callConnectionId": "gpt-realtime-connection",
+            "correlationId": "gpt-realtime-correlation",
+            "model": "gpt-realtime",
+            "endpoint": GPT_REALTIME_ENDPOINT
+        }
+    }))
+    
+    # Track connection and audio processing for GPT Realtime API
+    connection_start_time = asyncio.get_event_loop().time()
+    last_transcription_time = 0
+    transcription_interval = 2.0  # Send transcription every 2 seconds for real-time experience
+    audio_buffer = bytearray()
+    
+    try:
+        while True:
+            current_time = asyncio.get_event_loop().time()
+            
+            # Wait 2 seconds before starting to request audio data
+            if (current_time - connection_start_time) < 2.0:
+                await asyncio.sleep(0.1)
+                continue
+            
+            # Send periodic requests for audio data
+            if (current_time - last_transcription_time) >= transcription_interval:
+                logger.info(f"🎤 Requesting audio data for GPT Realtime API transcription")
+                
+                # Request current audio from frontend
+                await websocket.send_text(json.dumps({
+                    "action": "get_audio",
+                    "timestamp": current_time
+                }))
+                
+                last_transcription_time = current_time
+            
+            # Wait a bit before next check
+            await asyncio.sleep(0.1)
+            
+            # Handle incoming messages from frontend (non-blocking)
+            try:
+                # Use asyncio.wait_for to make receive_text non-blocking
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                message = json.loads(data)
+                
+                if message.get("action") == "audio_data":
+                    audio_data = message.get("audio_data")
+                    status = message.get("status", "")
+                    
+                    if audio_data and len(audio_data) > 0:
+                        logger.info(f"🎤 Processing audio data with Whisper API ({len(audio_data)} bytes)")
+                    elif status == "no_recording":
+                        logger.info(f"🎤 Frontend has no recording available yet - waiting...")
+                        continue
+                    else:
+                        logger.info(f"🎤 Empty audio data received - skipping processing")
+                        continue
+                    
+                    try:
+                        # Decode base64 audio
+                        audio_bytes = base64.b64decode(audio_data)
+                        
+                        # Use Azure Whisper API for real-time transcription
+                        whisper_deployment = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
+                        whisper_key = os.getenv("AZURE_WHISPER_KEY", os.getenv("AZURE_OPENAI_KEY"))
+                        whisper_api_version = os.getenv("AZURE_WHISPER_API_VERSION", "2024-06-01")
+                        
+                        # Create Whisper API client
+                        whisper_client = AzureOpenAI(
+                            api_key=whisper_key,
+                            api_version=whisper_api_version,
+                            azure_endpoint="https://hakeem-4411-resource.cognitiveservices.azure.com/"
+                        )
+                        
+                        # Save to temporary file for Whisper API
+                        with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as temp_audio:
+                            temp_audio.write(audio_bytes)
+                            temp_audio_path = temp_audio.name
+                        
+                        # Process audio with Whisper API
+                        with open(temp_audio_path, "rb") as audio_file:
+                            transcription = whisper_client.audio.transcriptions.create(
+                                model=whisper_deployment,
+                                file=audio_file,
+                                language="en"
+                            )
+                        
+                        transcribed_text = transcription.text.strip()
+                        logger.info(f"🎤 Real-time Whisper API transcription: {transcribed_text}")
+                        logger.info(f"🎤 WebSocket state before sending: {websocket.client_state}")
+                        
+                        # Send transcription data back to frontend via WebSocket
+                        logger.info(f"🎤 Attempting to send transcription via WebSocket...")
+                        try:
+                            transcription_message = json.dumps({
+                                "kind": "TranscriptionData",
+                                "transcriptionData": {
+                                    "text": transcribed_text,
+                                    "format": "display",
+                                    "confidence": 0.95,
+                                    "offset": int(current_time * 1000000),  # Convert to microseconds
+                                    "words": [
+                                        {
+                                            "text": word,
+                                            "offset": int(current_time * 1000000)
+                                        } for word in transcribed_text.split()
+                                    ],
+                                    "participantRawID": "gpt-realtime-user",
+                                    "resultStatus": "Final",
+                                    "apiSource": "Azure GPT Realtime API"
+                                }
+                            })
+                            
+                            logger.info(f"🎤 Prepared transcription message: {transcription_message[:100]}...")
+                            await websocket.send_text(transcription_message)
+                            logger.info(f"🎤 Sent GPT Realtime transcription to frontend: {transcribed_text}")
+                        except Exception as send_error:
+                            logger.error(f"❌ Failed to send transcription to frontend: {str(send_error)}")
+                            # Don't close WebSocket, just log the error and continue
+                        
+                        # Clean up temp file
+                        os.unlink(temp_audio_path)
+                            
+                    except Exception as gpt_error:
+                            logger.error(f"❌ Real-time GPT Realtime API error: {str(gpt_error)}")
+                            try:
+                                await websocket.send_text(json.dumps({
+                                    "kind": "TranscriptionData",
+                                    "transcriptionData": {
+                                        "text": "",
+                                        "format": "display",
+                                        "confidence": 0.0,
+                                        "offset": int(current_time * 1000000),
+                                        "words": [],
+                                        "participantRawID": "gpt-realtime-user",
+                                        "resultStatus": "Failed",
+                                        "error": str(gpt_error)
+                                    }
+                                }))
+                            except Exception as send_error:
+                                logger.error(f"❌ Failed to send error message to frontend: {str(send_error)}")
+                                # Don't close WebSocket, just log the error and continue
+                            
+            except asyncio.TimeoutError:
+                # No message received within timeout - this is normal, continue loop
+                pass
+            except Exception as e:
+                logger.error(f"❌ WebSocket message error: {str(e)}")
+                pass
+                
+    except WebSocketDisconnect:
+        logger.info("🎤 WebSocket connection closed")
+    except Exception as e:
+        logger.error(f"❌ WebSocket error: {str(e)}")
+        try:
+            await websocket.close()
+        except:
+            pass
