@@ -292,6 +292,24 @@ class AzureOpenAIService:
         # Default fallback
         return {"max_tokens": 4096}
     
+    def _get_model_temperature(self, model_name: str):
+        """
+        Get model-specific temperature parameter based on model requirements
+        
+        Returns:
+            dict with temperature parameter or empty dict if not supported
+        """
+        # o4-mini only supports temperature: 1.0 (default value, must be explicitly set)
+        if model_name == 'o4-mini':
+            return {"temperature": 1.0}  # Must be 1.0, not 0.7
+        
+        # o3-mini does NOT support temperature parameter at all
+        if model_name == 'o3-mini':
+            return {}  # Don't include temperature parameter
+        
+        # All other models support temperature: 0.7
+        return {"temperature": 0.7}
+    
     def _create_client_for_model(self, deployment_name: str = None):
         """Create Azure OpenAI client for a specific model"""
         model_config = self._get_model_config(deployment_name)
@@ -399,21 +417,24 @@ class AzureOpenAIService:
                 # Different models may need different parameters
                 # Get model-specific token parameters
                 token_params = self._get_model_token_params(model_config['name'])
+                # Get model-specific temperature parameters (some models have restrictions)
+                temp_params = self._get_model_temperature(model_config['name'])
                 
                 if model_config['name'] == 'DeepSeek-R1':
                     payload = {
                         "model": model_config["deployment"],
                         "messages": self.conversations[conversation_key],
                         **token_params,  # Use model-specific token params
-                        "temperature": 0.7
+                        **temp_params,  # Use model-specific temperature params
                     }
                 else:
                     # For Azure OpenAI deployments, use minimal payload
                     # Use model-specific token parameters (max_tokens or max_completion_tokens)
+                    # Use model-specific temperature parameters (some models don't support it)
                     payload = {
                         "messages": self.conversations[conversation_key],
                         **token_params,  # Use model-specific token params
-                        "temperature": 0.7
+                        **temp_params,  # Use model-specific temperature params
                     }
                     
                     # Only add optional parameters for models that support them
@@ -430,7 +451,11 @@ class AzureOpenAIService:
                 token_param_value = payload.get('max_tokens') or payload.get('max_completion_tokens', 'N/A')
                 token_param_name = 'max_completion_tokens' if 'max_completion_tokens' in payload else 'max_tokens'
                 logger.info(f"   - {token_param_name}: {token_param_value}")
-                logger.info(f"   - Temperature: {payload.get('temperature', 'N/A')}")
+                # Log temperature (some models don't support it)
+                if 'temperature' in payload:
+                    logger.info(f"   - Temperature: {payload.get('temperature', 'N/A')}")
+                else:
+                    logger.info(f"   - Temperature: Not included (model doesn't support it)")
                 logger.info(f"   - Payload keys: {list(payload.keys())}")
                 
                 # Check if request cancelled before making HTTP call
