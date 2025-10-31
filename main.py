@@ -2,7 +2,11 @@ from typing import Union, List, Dict, Any
 import logging
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+try:
+    import redis.asyncio as redis
+except Exception:
+    redis = None  # Redis is optional
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AzureOpenAI, RateLimitError
@@ -14,6 +18,102 @@ import json
 from datetime import datetime
 from database_schema import DatabaseManager
 from time import time
+from collections import OrderedDict
+
+class TTLCache:
+    """Simple LRU + TTL cache for recent validation results"""
+    def __init__(self, maxsize: int = 200, ttl_seconds: int = 300):
+        self.store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self.maxsize = maxsize
+        self.ttl = ttl_seconds
+
+    def get(self, key: str):
+        now = time()
+        item = self.store.get(key)
+        if not item:
+            return None
+        expires_at, value = item
+        if expires_at < now:
+            # expired
+            try:
+                del self.store[key]
+            except KeyError:
+                pass
+            return None
+        # move to end (recently used)
+        self.store.move_to_end(key)
+        return value
+
+    def set(self, key: str, value: Any):
+        now = time()
+        expires_at = now + self.ttl
+        self.store[key] = (expires_at, value)
+        self.store.move_to_end(key)
+        # evict oldest
+        while len(self.store) > self.maxsize:
+            self.store.popitem(last=False)
+
+# ---------------------
+# Idempotency + Work Queue
+# ---------------------
+_inflight_validations: Dict[str, asyncio.Future] = {}
+_validation_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+_workers_started = False
+
+async def _validation_worker():
+    while True:
+        key, user_answer, question_guardrail, q41_guardrail = await _validation_queue.get()
+        fut: asyncio.Future = _inflight_validations.get(key)
+        try:
+            result = await validate_answer_with_ai(user_answer, question_guardrail, q41_guardrail)
+            if not fut.done():
+                fut.set_result(result)
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+        finally:
+            _validation_queue.task_done()
+            # Clean inflight entry
+            try:
+                _inflight_validations.pop(key, None)
+            except Exception:
+                pass
+
+def _ensure_workers_started(num_workers: int = 2):
+    global _workers_started
+    if _workers_started:
+        return
+    loop = asyncio.get_event_loop()
+    for _ in range(num_workers):
+        loop.create_task(_validation_worker())
+    _workers_started = True
+
+# ---------------------
+# Simple per-IP rate limiter (token bucket)
+# ---------------------
+class PerIpLimiter:
+    def __init__(self, capacity: int = 5, refill_per_sec: float = 2.0):
+        self.capacity = capacity
+        self.refill_per_sec = refill_per_sec
+        self.tokens: Dict[str, float] = {}
+        self.last: Dict[str, float] = {}
+
+    def allow(self, ip: str) -> bool:
+        now = time()
+        last = self.last.get(ip, now)
+        available = self.tokens.get(ip, self.capacity)
+        # Refill
+        available = min(self.capacity, available + (now - last) * self.refill_per_sec)
+        if available >= 1.0:
+            available -= 1.0
+            self.tokens[ip] = available
+            self.last[ip] = now
+            return True
+        self.tokens[ip] = available
+        self.last[ip] = now
+        return False
+
+per_ip_limiter = PerIpLimiter(capacity=6, refill_per_sec=3.0)
 
 # Load environment variables
 load_dotenv()
@@ -39,6 +139,72 @@ app.add_middleware(
 
 # Initialize database manager
 db_manager = DatabaseManager()
+
+# Instance id for distributed locks
+_instance_id = str(uuid.uuid4())
+
+# Optional Redis client (lazy)
+_redis_client = None
+
+async def get_redis_client():
+    global _redis_client
+    if redis is None:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    redis_url = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
+    if not redis_url:
+        return None
+    try:
+        _redis_client = await redis.from_url(redis_url, encoding="utf-8", decode_responses=True)
+        return _redis_client
+    except Exception:
+        _redis_client = None
+        return None
+
+async def redis_cache_get(key: str):
+    client = await get_redis_client()
+    if not client:
+        return None
+    try:
+        val = await client.get(key)
+        if not val:
+            return None
+        return json.loads(val)
+    except Exception:
+        return None
+
+async def redis_cache_set(key: str, value: Any, ttl: int = 300):
+    client = await get_redis_client()
+    if not client:
+        return False
+    try:
+        await client.set(key, json.dumps(value), ex=ttl)
+        return True
+    except Exception:
+        return False
+
+async def redis_acquire_lock(lock_key: str, ttl: int = 20) -> bool:
+    client = await get_redis_client()
+    if not client:
+        return False
+    try:
+        # SET NX EX
+        ok = await client.set(lock_key, _instance_id, nx=True, ex=ttl)
+        return bool(ok)
+    except Exception:
+        return False
+
+async def redis_release_lock(lock_key: str):
+    client = await get_redis_client()
+    if not client:
+        return
+    try:
+        owner = await client.get(lock_key)
+        if owner == _instance_id:
+            await client.delete(lock_key)
+    except Exception:
+        pass
 
 # Rate Limiting Configuration
 class RateLimiter:
@@ -83,7 +249,8 @@ class RateLimiter:
         logger.warning(f"⚠️ Rate limit hit (#{self.rate_limit_hits}). Consider increasing delays or reducing concurrent requests.")
 
 # Global rate limiter instance
-rate_limiter = RateLimiter(max_concurrent=3, min_delay=0.8)  # 3 concurrent requests, 0.8s delay
+# Tighter limits to avoid 429s from Azure (serialize validations with a small spacing)
+rate_limiter = RateLimiter(max_concurrent=1, min_delay=1.2)
 
 # Dynamic guidelines are now generated from client guardrails in the database
 # No hardcoded QUESTION_GUIDELINES needed
@@ -234,7 +401,7 @@ class AzureOpenAIService:
                 response = self.client.chat.completions.create(
                     model=self.deployment,
                     messages=self.conversations[thread_id],
-                    max_tokens=6553,
+                    max_tokens=2048,
                     temperature=0.7,
                     top_p=0.95,
                     frequency_penalty=0,
@@ -333,7 +500,7 @@ CRITICAL: Return only valid JSON. Do not include any text before or after the JS
                         "content": validation_prompt
                     }
                 ],
-                max_tokens=500,
+                max_tokens=400,
                 temperature=0.3,
                 top_p=0.95,
                 frequency_penalty=0,
@@ -1000,6 +1167,53 @@ async def validate_answer_with_ai(user_answer: str, question_guardrail: str = No
         raise ValueError("Q41 guardrail must be provided from frontend")
     
     try:
+        # Cache key for identical validations (user answer + guardrails)
+        global _validation_cache
+        try:
+            _validation_cache
+        except NameError:
+            _validation_cache = TTLCache(maxsize=200, ttl_seconds=300)
+
+        cache_key = json.dumps({
+            "ua": user_answer,
+            "qg": question_guardrail,
+            "q41": q41_guardrail
+        }, sort_keys=True)
+        cached = _validation_cache.get(cache_key)
+        if cached:
+            logger.info("🗄️ Cache hit for validation; skipping model call")
+            return cached
+        # Fast path: short-circuit obviously too-short answers to avoid model calls
+        min_chars_required = 0
+        import re as _re
+        if q41_guardrail:
+            # Extract first integer found in guardrail like "Enter minimum 25 characters"
+            m = _re.search(r"(\d+)", q41_guardrail)
+            if m:
+                min_chars_required = int(m.group(1))
+        if min_chars_required and len(user_answer.strip()) < min_chars_required:
+            logger.info("🔎 Short-circuit: below min characters; skipping model call")
+            suggested = await generate_suggested_answer(
+                user_answer=user_answer,
+                question_guardrail=question_guardrail,
+                q41_guardrail=q41_guardrail,
+                missing_elements=["Ensure the response meets the minimum word count"],
+                analysis="Add more detail to meet the length requirement."
+            )
+            return {
+                "word_count": word_count,
+                "missing_elements": ["Ensure the response meets the minimum word count"],
+                "safety_concerns": [],
+                "guidelines_checked": [
+                    "Question-specific requirements (rule-based)",
+                    "Q41 general requirements (rule-based)"
+                ],
+                "ai_analysis": "Answer is below minimum character requirement.",
+                "word_count_analysis": f"Below minimum of {min_chars_required} characters.",
+                "content_quality": "Too brief to assess.",
+                "suggested_answer": suggested
+            }
+
         # Create AI prompt for validation
         validation_prompt = f"""
 You are a helpful guide helping a care worker complete their shift notes. Be supportive, clear, and specific. Help them improve their answer, don't criticize it.
@@ -1189,7 +1403,24 @@ Step 4: Does answer contain relevant information about client/event/situation?
         logger.info("🤖 Sending validation request to AI model...")
         
         # Call AI model for validation
-        response = await call_ai_model(validation_prompt)
+        # Add an overall timeout to the model call
+        try:
+            response = await asyncio.wait_for(call_ai_model(validation_prompt), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning("⏳ Validation model call timed out after 15s; returning fallback")
+            return {
+                "word_count": word_count,
+                "missing_elements": ["Validation timed out - please try again"],
+                "safety_concerns": [],
+                "guidelines_checked": [
+                    "Question-specific requirements (timeout)",
+                    "Q41 general requirements (timeout)"
+                ],
+                "ai_analysis": "Validation timed out.",
+                "word_count_analysis": "",
+                "content_quality": "",
+                "suggested_answer": ""
+            }
         
         logger.info("🤖 AI Response received:")
         logger.info(f"📝 Full Response: {response}")
@@ -1326,6 +1557,8 @@ Step 4: Does answer contain relevant information about client/event/situation?
             logger.info(f"📝 FINAL SUGGESTED ANSWER: '{suggested_answer}'")
             logger.info(f"📝 SUGGESTED ANSWER LENGTH: {len(suggested_answer)}")
             
+            # Store in cache before returning
+            _validation_cache.set(cache_key, result)
             return result
             
         except json.JSONDecodeError as e:
@@ -1373,7 +1606,9 @@ async def call_ai_model(prompt: str, max_retries: int = 3) -> str:
         try:
             # Use rate limiter to prevent hitting rate limits
             async with rate_limiter:
-                logger.info(f"🤖 Calling Azure OpenAI for validation... (attempt {retry_count + 1}/{max_retries + 1})")
+                # Log only on retries to reduce noise
+                if retry_count > 0:
+                    logger.warning(f"⏳ Retrying Azure OpenAI call... (attempt {retry_count + 1}/{max_retries + 1})")
                 
                 # Use your existing Azure OpenAI service with proper parameters
                 # Create a thread for this validation request
@@ -1389,9 +1624,24 @@ async def call_ai_model(prompt: str, max_retries: int = 3) -> str:
             rate_limiter.on_rate_limit_hit()
             
             if retry_count <= max_retries:
-                # Exponential backoff: wait longer with each retry
-                wait_time = min(2 ** retry_count, 30)  # Cap at 30 seconds
-                logger.warning(f"⏳ Rate limit hit (429). Retrying in {wait_time} seconds... (attempt {retry_count}/{max_retries})")
+                # Honor Retry-After header if available; otherwise exponential backoff with jitter
+                retry_after = None
+                try:
+                    # Azure SDK exceptions may carry response/headers
+                    resp = getattr(e, 'response', None)
+                    headers = getattr(resp, 'headers', {}) if resp else {}
+                    retry_after = headers.get('Retry-After') or headers.get('retry-after')
+                except Exception:
+                    retry_after = None
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:
+                        wait_time = min(2 ** retry_count, 30)
+                else:
+                    import random as _rnd
+                    wait_time = min(2 ** retry_count, 30) + _rnd.uniform(0, 0.5)
+                logger.warning(f"⏳ Rate limit hit (429). Waiting {wait_time:.1f}s before retry {retry_count}/{max_retries}")
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"❌ Rate limit exceeded after {max_retries} retries")
@@ -1409,8 +1659,10 @@ async def call_ai_model(prompt: str, max_retries: int = 3) -> str:
                 rate_limiter.on_rate_limit_hit()
                 
                 if retry_count <= max_retries:
-                    wait_time = min(2 ** retry_count, 30)
-                    logger.warning(f"⏳ Rate limit detected. Retrying in {wait_time} seconds... (attempt {retry_count}/{max_retries})")
+                    # No direct headers; use jittered backoff
+                    import random as _rnd
+                    wait_time = min(2 ** retry_count, 30) + _rnd.uniform(0, 0.5)
+                    logger.warning(f"⏳ Rate limit detected. Waiting {wait_time:.1f}s before retry {retry_count}/{max_retries}")
                     await asyncio.sleep(wait_time)
                     continue
             
@@ -2320,7 +2572,7 @@ def extract_concepts_from_message(message: str) -> List[str]:
 
 # Answer validation API endpoint
 @app.post("/validate-answer", response_model=AnswerValidationResponse)
-async def validate_answer(request: AnswerValidationRequest):
+async def validate_answer(request: AnswerValidationRequest, http_request: Request):
     """
     Validate answer against question guidelines and Q41 universal guidelines
     
@@ -2331,6 +2583,11 @@ async def validate_answer(request: AnswerValidationRequest):
     """
     try:
         logger.info(f"🔍 Validating answer")
+        # Per-IP basic throttle to avoid bursts
+        client_ip = http_request.client.host if http_request and http_request.client else "unknown"
+        if not per_ip_limiter.allow(client_ip):
+            logger.warning("🚦 Per-IP rate limit reached; returning 429 with Retry-After")
+            raise HTTPException(status_code=429, detail="Too Many Requests", headers={"Retry-After": "2"})
         logger.info(f"📝 Answer: {request.user_answer[:100]}...")
         logger.info(f"📋 Question Guardrail: {request.question_guardrail}")
         logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail}")
@@ -2350,12 +2607,93 @@ async def validate_answer(request: AnswerValidationRequest):
         if request.ai_suggestion:
             logger.info(f"   - ai_suggestion: '{request.ai_suggestion[:100]}...'")
         
-        # Validate answer content using AI model with dynamic guardrails
-        validation_result = await validate_answer_with_ai(
-            request.user_answer,
-            request.question_guardrail,
-            request.q41_guardrail
-        )
+        # Start background workers if not started
+        _ensure_workers_started(num_workers=2)
+
+        # Build idempotency key from payload (could also accept header)
+        idem_payload = {
+            "ua": request.user_answer,
+            "qg": request.question_guardrail,
+            "q41": request.q41_guardrail,
+            "ver": 1
+        }
+        idem_key = json.dumps(idem_payload, sort_keys=True)
+        cache_key = "val:cache:" + idem_key
+        lock_key = "val:lock:" + idem_key
+
+        # First try Redis cache (cross-instance)
+        cached_dist = await redis_cache_get(cache_key)
+        if cached_dist:
+            logger.info("🗄️ Redis cache hit for validation; returning cached result")
+            validation_result = cached_dist
+        else:
+            # Try to acquire distributed lock to become the leader for this key
+            have_lock = await redis_acquire_lock(lock_key, ttl=20)
+            if not have_lock:
+                # Another instance is computing; poll cache for result up to 12s
+                logger.info("⏳ Waiting for leader result via Redis cache")
+                deadline = asyncio.get_event_loop().time() + 12
+                validation_result = None
+                while asyncio.get_event_loop().time() < deadline:
+                    cached_dist = await redis_cache_get(cache_key)
+                    if cached_dist:
+                        validation_result = cached_dist
+                        break
+                    await asyncio.sleep(0.2)
+                if validation_result is None:
+                    # Fall back to local coalescing path
+                    logger.info("↩️ Falling back to local coalescing path (no cache yet)")
+                    # Coalesce in-flight identical requests locally
+                    fut = _inflight_validations.get(idem_key)
+                    if fut is None:
+                        fut = asyncio.get_event_loop().create_future()
+                        if idem_key in _inflight_validations:
+                            fut = _inflight_validations[idem_key]
+                        else:
+                            if _validation_queue.full():
+                                logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
+                                raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
+                            _inflight_validations[idem_key] = fut
+                            await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
+                    validation_result = await fut
+                # else got result from cache
+            else:
+                # We are the leader: use local coalescing to compute, then set Redis cache
+                fut = _inflight_validations.get(idem_key)
+                if fut is None:
+                    fut = asyncio.get_event_loop().create_future()
+                    if idem_key in _inflight_validations:
+                        fut = _inflight_validations[idem_key]
+                    else:
+                        if _validation_queue.full():
+                            await redis_release_lock(lock_key)
+                            logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
+                            raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
+                        _inflight_validations[idem_key] = fut
+                        await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
+                validation_result = await fut
+                # Store to Redis cache and release lock
+                await redis_cache_set(cache_key, validation_result, ttl=300)
+                await redis_release_lock(lock_key)
+
+        # Coalesce in-flight identical requests
+        fut = _inflight_validations.get(idem_key)
+        if fut is None:
+            # Enqueue if capacity allows
+            fut = asyncio.get_event_loop().create_future()
+            # Double-check race
+            if idem_key in _inflight_validations:
+                fut = _inflight_validations[idem_key]
+            else:
+                # Try to enqueue without waiting when queue is full
+                if _validation_queue.full():
+                    logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
+                    raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
+                _inflight_validations[idem_key] = fut
+                await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
+
+        # Await the shared result
+        # validation_result is set by one of the branches above
         
         # CRITICAL: Always check safety concerns FIRST - they override everything
         safety_concerns = validation_result.get("safety_concerns", [])
