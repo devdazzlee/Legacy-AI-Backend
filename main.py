@@ -2,118 +2,23 @@ from typing import Union, List, Dict, Any
 import logging
 import os
 from dotenv import load_dotenv
-try:
-    import redis.asyncio as redis
-except Exception:
-    redis = None  # Redis is optional
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AzureOpenAI, RateLimitError
+
+# Simple RateLimitError class for direct HTTP calls (when not using SDK)
+class SimpleRateLimitError(Exception):
+    """Simple rate limit error for direct HTTP calls"""
+    pass
 import uuid
 import asyncio
 import base64
 import tempfile
 import json
 from datetime import datetime
-from database_schema import DatabaseManager
-from time import time
-from collections import OrderedDict
-
-class TTLCache:
-    """Simple LRU + TTL cache for recent validation results"""
-    def __init__(self, maxsize: int = 200, ttl_seconds: int = 300):
-        self.store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
-        self.maxsize = maxsize
-        self.ttl = ttl_seconds
-
-    def get(self, key: str):
-        now = time()
-        item = self.store.get(key)
-        if not item:
-            return None
-        expires_at, value = item
-        if expires_at < now:
-            # expired
-            try:
-                del self.store[key]
-            except KeyError:
-                pass
-            return None
-        # move to end (recently used)
-        self.store.move_to_end(key)
-        return value
-
-    def set(self, key: str, value: Any):
-        now = time()
-        expires_at = now + self.ttl
-        self.store[key] = (expires_at, value)
-        self.store.move_to_end(key)
-        # evict oldest
-        while len(self.store) > self.maxsize:
-            self.store.popitem(last=False)
-
-# ---------------------
-# Idempotency + Work Queue
-# ---------------------
-_inflight_validations: Dict[str, asyncio.Future] = {}
-_validation_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
-_workers_started = False
-
-async def _validation_worker():
-    while True:
-        key, user_answer, question_guardrail, q41_guardrail = await _validation_queue.get()
-        fut: asyncio.Future = _inflight_validations.get(key)
-        try:
-            result = await validate_answer_with_ai(user_answer, question_guardrail, q41_guardrail)
-            if not fut.done():
-                fut.set_result(result)
-        except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
-        finally:
-            _validation_queue.task_done()
-            # Clean inflight entry
-            try:
-                _inflight_validations.pop(key, None)
-            except Exception:
-                pass
-
-def _ensure_workers_started(num_workers: int = 2):
-    global _workers_started
-    if _workers_started:
-        return
-    loop = asyncio.get_event_loop()
-    for _ in range(num_workers):
-        loop.create_task(_validation_worker())
-    _workers_started = True
-
-# ---------------------
-# Simple per-IP rate limiter (token bucket)
-# ---------------------
-class PerIpLimiter:
-    def __init__(self, capacity: int = 5, refill_per_sec: float = 2.0):
-        self.capacity = capacity
-        self.refill_per_sec = refill_per_sec
-        self.tokens: Dict[str, float] = {}
-        self.last: Dict[str, float] = {}
-
-    def allow(self, ip: str) -> bool:
-        now = time()
-        last = self.last.get(ip, now)
-        available = self.tokens.get(ip, self.capacity)
-        # Refill
-        available = min(self.capacity, available + (now - last) * self.refill_per_sec)
-        if available >= 1.0:
-            available -= 1.0
-            self.tokens[ip] = available
-            self.last[ip] = now
-            return True
-        self.tokens[ip] = available
-        self.last[ip] = now
-        return False
-
-per_ip_limiter = PerIpLimiter(capacity=6, refill_per_sec=3.0)
+# from database_schema import DatabaseManager
+import time
 
 # Load environment variables
 load_dotenv()
@@ -138,119 +43,10 @@ app.add_middleware(
 )
 
 # Initialize database manager
-db_manager = DatabaseManager()
-
-# Instance id for distributed locks
-_instance_id = str(uuid.uuid4())
-
-# Optional Redis client (lazy)
-_redis_client = None
-
-async def get_redis_client():
-    global _redis_client
-    if redis is None:
-        return None
-    if _redis_client is not None:
-        return _redis_client
-    redis_url = os.getenv("REDIS_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
-    if not redis_url:
-        return None
-    try:
-        _redis_client = await redis.from_url(redis_url, encoding="utf-8", decode_responses=True)
-        return _redis_client
-    except Exception:
-        _redis_client = None
-        return None
-
-async def redis_cache_get(key: str):
-    client = await get_redis_client()
-    if not client:
-        return None
-    try:
-        val = await client.get(key)
-        if not val:
-            return None
-        return json.loads(val)
-    except Exception:
-        return None
-
-async def redis_cache_set(key: str, value: Any, ttl: int = 300):
-    client = await get_redis_client()
-    if not client:
-        return False
-    try:
-        await client.set(key, json.dumps(value), ex=ttl)
-        return True
-    except Exception:
-        return False
-
-async def redis_acquire_lock(lock_key: str, ttl: int = 20) -> bool:
-    client = await get_redis_client()
-    if not client:
-        return False
-    try:
-        # SET NX EX
-        ok = await client.set(lock_key, _instance_id, nx=True, ex=ttl)
-        return bool(ok)
-    except Exception:
-        return False
-
-async def redis_release_lock(lock_key: str):
-    client = await get_redis_client()
-    if not client:
-        return
-    try:
-        owner = await client.get(lock_key)
-        if owner == _instance_id:
-            await client.delete(lock_key)
-    except Exception:
-        pass
+# db_manager = DatabaseManager()
 
 # Rate Limiting Configuration
-class RateLimiter:
-    """Rate limiter to prevent hitting Azure OpenAI API rate limits"""
-    def __init__(self, max_concurrent: int = 3, min_delay: float = 0.5):
-        """
-        Args:
-            max_concurrent: Maximum number of concurrent requests
-            min_delay: Minimum delay between requests in seconds
-        """
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.min_delay = min_delay
-        self.last_request_time = 0
-        self.rate_limit_hits = 0
-        
-    async def acquire(self):
-        """Acquire rate limiter lock and enforce delay"""
-        await self.semaphore.acquire()
-        
-        # Enforce minimum delay between requests
-        current_time = time()
-        time_since_last = current_time - self.last_request_time
-        if time_since_last < self.min_delay:
-            await asyncio.sleep(self.min_delay - time_since_last)
-        
-        self.last_request_time = time()
-    
-    def release(self):
-        """Release rate limiter lock"""
-        self.semaphore.release()
-    
-    async def __aenter__(self):
-        await self.acquire()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.release()
-    
-    def on_rate_limit_hit(self):
-        """Called when a rate limit error is detected"""
-        self.rate_limit_hits += 1
-        logger.warning(f"⚠️ Rate limit hit (#{self.rate_limit_hits}). Consider increasing delays or reducing concurrent requests.")
-
-# Global rate limiter instance
-# Tighter limits to avoid 429s from Azure (serialize validations with a small spacing)
-rate_limiter = RateLimiter(max_concurrent=1, min_delay=1.2)
+# Rate limiter removed - using direct model calls without rate limiting
 
 # Dynamic guidelines are now generated from client guardrails in the database
 # No hardcoded QUESTION_GUIDELINES needed
@@ -278,6 +74,8 @@ class AnswerValidationRequest(BaseModel):
     question_guardrail: str = None  # Question-specific guardrail from frontend
     q41_guardrail: str = None  # Q41 guardrail (word count) from frontend
     ai_suggestion: str = None  # Optional: AI suggestion that user was asked to modify
+    request_id: str = None  # Optional: Unique request ID for tracking and cancellation
+    timestamp: int = None  # Optional: Request timestamp (milliseconds) for late response detection
 
 class AnswerValidationResponse(BaseModel):
     status: str  # "approve", "reject", "review"
@@ -289,6 +87,7 @@ class AnswerValidationResponse(BaseModel):
     word_count: int
     guidelines_checked: List[str] = []
     modification_status: dict = {}  # Status of modifications if ai_suggestion was provided
+    request_id: str = None  # Optional: Request ID for tracking and cancellation
 
 class ThreadMessagesResponse(BaseModel):
     success: bool
@@ -341,49 +140,203 @@ class PrescreenerResponse(BaseModel):
     requiredActions: List[str]  # What user must do next
     canSubmit: bool  # Whether user can submit the current message
 
+# Request tracking system for cancellation and late response detection
+class RequestTracker:
+    """Track active requests for cancellation and late response detection"""
+    def __init__(self):
+        self.active_requests: Dict[str, Dict[str, Any]] = {}  # request_id -> {timestamp, cancelled, task}
+        self.max_request_age = 120  # Maximum age in seconds (2 minutes)
+    
+    def register_request(self, request_id: str, timestamp: int = None):
+        """Register a new request"""
+        if not timestamp:
+            timestamp = int(time.time() * 1000)  # milliseconds
+        
+        self.active_requests[request_id] = {
+            "timestamp": timestamp,
+            "cancelled": False,
+            "age_seconds": 0
+        }
+        logger.info(f"📝 Registered request: {request_id} at {timestamp}")
+    
+    def cancel_request(self, request_id: str):
+        """Cancel a request"""
+        if request_id in self.active_requests:
+            self.active_requests[request_id]["cancelled"] = True
+            logger.info(f"🚫 Cancelled request: {request_id}")
+            return True
+        return False
+    
+    def is_cancelled(self, request_id: str) -> bool:
+        """Check if request is cancelled"""
+        if request_id and request_id in self.active_requests:
+            return self.active_requests[request_id]["cancelled"]
+        return False
+    
+    def is_too_old(self, request_id: str) -> bool:
+        """Check if request is too old (late response)"""
+        if not request_id or request_id not in self.active_requests:
+            return False
+        
+        timestamp = self.active_requests[request_id]["timestamp"]
+        age_seconds = (int(time.time() * 1000) - timestamp) / 1000
+        
+        if age_seconds > self.max_request_age:
+            logger.warning(f"⏰ Request {request_id} is too old ({age_seconds:.1f}s > {self.max_request_age}s) - ignoring late response")
+            return True
+        return False
+    
+    def cleanup_old_requests(self):
+        """Remove old requests from tracking"""
+        current_time = int(time.time() * 1000)
+        to_remove = []
+        
+        for request_id, data in self.active_requests.items():
+            age_seconds = (current_time - data["timestamp"]) / 1000
+            if age_seconds > self.max_request_age * 2:  # Remove after 2x max age
+                to_remove.append(request_id)
+        
+        for request_id in to_remove:
+            del self.active_requests[request_id]
+        
+        if to_remove:
+            logger.info(f"🧹 Cleaned up {len(to_remove)} old requests")
+
+# Global request tracker
+request_tracker = RequestTracker()
+
 # Azure OpenAI Service
 class AzureOpenAIService:
-    """Service class for Azure OpenAI integration"""
+    """Service class for Azure OpenAI integration with hardcoded models"""
     
     def __init__(self):
         self.client = None
         self._initialized = False
         self.conversations = {}  # Store conversations in memory
-        self.deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "o4-mini")  # Store deployment name
+        self.active_cancellations = {}  # request_id -> cancellation token
+        
+        # Hardcoded models - 5 models configured directly in code
+        # All use the same API key
+        self.api_key = "47oYsTR8tSAcu3BJqsXDg4zZXLOcO1fY0uxhkR5fghe2NFmJm6A6JQQJ99BGACHYHv6XJ3w3AAAAACOG5jxP"
+        
+        # Model configurations - ordered by priority (tried in this order)
+        self.models = [
+            {
+                "name": "gpt-4o",
+                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
+                "deployment": "gpt-4o",
+                "api_version": "2025-01-01-preview"
+            },
+            {
+                "name": "o4-mini",
+                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
+                "deployment": "o4-mini",
+                "api_version": "2025-01-01-preview"
+            },
+            {
+                "name": "o3-mini",
+                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
+                "deployment": "o3-mini",
+                "api_version": "2025-01-01-preview"
+            },
+            {
+                "name": "gpt-35-turbo",
+                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
+                "deployment": "gpt-35-turbo",
+                "api_version": "2025-01-01-preview"
+            },
+            {
+                "name": "DeepSeek-R1",
+                "endpoint": "https://hakeem-4411-resource.services.ai.azure.com",
+                "deployment": "DeepSeek-R1",
+                "api_version": "2024-05-01-preview"
+            }
+        ]
+        
+        # Fallback deployment list - model names for easy reference
+        self.fallback_deployments = [model["name"] for model in self.models]
+        self.deployment = self.fallback_deployments[0]  # Primary deployment
     
-    def _initialize_client(self):
+    def _get_model_config(self, deployment_name: str = None):
+        """Get configuration for a specific model by name"""
+        model_name = deployment_name or self.deployment
+        for model in self.models:
+            if model["name"] == model_name:
+                return model
+        # Default to first model if not found
+        return self.models[0]
+    
+    def _create_client_for_model(self, deployment_name: str = None):
+        """Create Azure OpenAI client for a specific model"""
+        model_config = self._get_model_config(deployment_name)
+        
+        # Disable automatic retries - we want to handle retries ourselves and move to next model immediately
+        import httpx
+        
+        # Create custom HTTP client with NO retries
+        http_client = httpx.Client(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        )
+        
+        client = AzureOpenAI(
+            azure_endpoint=model_config["endpoint"],
+            api_key=self.api_key,
+            api_version=model_config["api_version"],
+            max_retries=0,  # Disable SDK automatic retries - we handle fallback manually
+            http_client=http_client  # Use custom client with no retries
+        )
+        
+        return client, model_config
+    
+    def _initialize_client(self, deployment_name: str = None):
         """Initialize the Azure OpenAI client"""
         try:
-            # Your Azure OpenAI configuration - loaded from environment variables
-            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-            api_key = os.getenv("AZURE_OPENAI_KEY")
-            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+            model_config = self._get_model_config(deployment_name)
             
-            if not endpoint or not api_key:
-                raise ValueError("Azure OpenAI credentials not found in environment variables")
+            # Disable automatic retries - we handle fallback manually
+            import httpx
+            
+            # Create custom HTTP client with NO retries
+            http_client = httpx.Client(
+                timeout=httpx.Timeout(60.0),
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+            )
             
             self.client = AzureOpenAI(
-                azure_endpoint=endpoint,
-                api_key=api_key,
-                api_version=api_version
+                azure_endpoint=model_config["endpoint"],
+                api_key=self.api_key,
+                api_version=model_config["api_version"],
+                max_retries=0,  # Disable SDK automatic retries - we handle fallback manually
+                http_client=http_client  # Use custom client with no retries
             )
             
             self._initialized = True
-            logger.info("Azure OpenAI client initialized successfully")
+            logger.info(f"Azure OpenAI client initialized successfully with model: {model_config['name']}")
             
         except Exception as e:
             logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
             raise
     
-    def send_message(self, thread_id: str, message: str) -> str:
-        """Send a message to Azure OpenAI and get response"""
+    async def send_message(self, thread_id: str, message: str, deployment: str = None, request_id: str = None) -> str:
+        """Send a message to Azure OpenAI and get response - ONE MODEL AT A TIME"""
         try:
-            if not self._initialized:
-                self._initialize_client()
+            # Check if request is cancelled before starting
+            if request_id and request_tracker.is_cancelled(request_id):
+                logger.warning(f"🚫 Request {request_id} is already cancelled - aborting call to {deployment}")
+                raise SimpleRateLimitError(f"Request {request_id} was cancelled")
             
-            # Initialize conversation history if not exists
-            if thread_id not in self.conversations:
-                self.conversations[thread_id] = [
+            # Get model configuration
+            model_config = self._get_model_config(deployment)
+            
+            logger.info(f"🔒 Starting call to model: {model_config['name']} (endpoint: {model_config['endpoint']})")
+            if request_id:
+                logger.info(f"📋 Request ID: {request_id}")
+            
+            # Initialize conversation history if not exists (keyed by model name)
+            conversation_key = f"{thread_id}-{model_config['name']}"
+            if conversation_key not in self.conversations:
+                self.conversations[conversation_key] = [
                     {
                         "role": "system",
                         "content": "You are an AI assistant that helps people find information."
@@ -391,44 +344,173 @@ class AzureOpenAIService:
                 ]
             
             # Add user message to conversation
-            self.conversations[thread_id].append({
+            self.conversations[conversation_key].append({
                 "role": "user",
                 "content": message
             })
             
-            # Get response from Azure OpenAI
+            # Get response from Azure OpenAI - DIRECT HTTP CALL to bypass SDK retry logic
+            # Use deployment name from model config
             try:
-                response = self.client.chat.completions.create(
-                    model=self.deployment,
-                    messages=self.conversations[thread_id],
-                    max_tokens=2048,
-                    temperature=0.7,
-                    top_p=0.95,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                    stop=None,
-                    stream=False
-                )
+                logger.info(f"⏳ Waiting for response from {model_config['name']}...")
                 
-                # Extract response content
-                response_content = response.choices[0].message.content
-            except RateLimitError as e:
-                logger.error(f"❌ Rate limit error (429) in send_message: {str(e)}")
-                logger.warning("⚠️ Azure OpenAI rate limit exceeded. The request will be retried automatically by the SDK.")
-                raise  # Re-raise to let the caller handle retries
+                # Make DIRECT HTTP request to bypass SDK retry logic
+                # This way we catch 429 errors immediately and move to next model
+                import httpx
+                import json
+                
+                # Build the API URL - handle different endpoint formats
+                endpoint = model_config['endpoint'].rstrip('/')
+                
+                if model_config['name'] == 'DeepSeek-R1':
+                    # DeepSeek-R1 uses different endpoint format
+                    api_url = f"{endpoint}/models/chat/completions?api-version={model_config['api_version']}"
+                else:
+                    # Standard Azure OpenAI chat completion format
+                    api_url = f"{endpoint}/openai/deployments/{model_config['deployment']}/chat/completions?api-version={model_config['api_version']}"
+                
+                # Prepare the request payload
+                # Different models may need different parameters
+                if model_config['name'] == 'DeepSeek-R1':
+                    payload = {
+                        "model": model_config["deployment"],
+                        "messages": self.conversations[conversation_key],
+                        "max_tokens": 6553,
+                        "temperature": 0.7
+                    }
+                else:
+                    # For Azure OpenAI deployments, use minimal payload first
+                    # Some models (o4-mini, o3-mini) may not support all parameters
+                    payload = {
+                        "messages": self.conversations[conversation_key],
+                        "max_tokens": 6553,
+                        "temperature": 0.7
+                    }
+                    
+                    # Only add optional parameters for models that support them
+                    # Avoid top_p, frequency_penalty, presence_penalty if they cause 400 errors
+                    # These will be tried without them first
+                
+                # Make direct HTTP request - NO SDK, NO RETRIES
+                # This bypasses all SDK retry logic - 429 errors caught immediately
+                logger.info(f"🌐 Making DIRECT HTTP request to {api_url} (NO SDK, NO RETRIES)")
+                logger.info(f"⚠️ Using DIRECT httpx call - SDK will NOT be used, NO automatic retries!")
+                logger.info(f"📤 Payload being sent to {model_config['name']}:")
+                logger.info(f"   - Messages count: {len(self.conversations[conversation_key])}")
+                logger.info(f"   - Max tokens: {payload.get('max_tokens', 'N/A')}")
+                logger.info(f"   - Temperature: {payload.get('temperature', 'N/A')}")
+                logger.info(f"   - Payload keys: {list(payload.keys())}")
+                
+                # Check if request cancelled before making HTTP call
+                if request_id and request_tracker.is_cancelled(request_id):
+                    logger.warning(f"🚫 Request {request_id} cancelled before HTTP call - aborting")
+                    raise SimpleRateLimitError(f"Request {request_id} was cancelled")
+                
+                async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as http_client:
+                    try:
+                        http_response = await http_client.post(
+                            api_url,
+                            headers={
+                                "api-key": self.api_key,
+                                "Content-Type": "application/json"
+                            },
+                            json=payload
+                        )
+                        
+                        logger.info(f"📊 HTTP Response Status: {http_response.status_code} from {model_config['name']}")
+                        
+                        # Check if request cancelled after HTTP call (but before processing)
+                        if request_id and request_tracker.is_cancelled(request_id):
+                            logger.warning(f"🚫 Request {request_id} was cancelled after HTTP call - ignoring response")
+                            raise SimpleRateLimitError(f"Request {request_id} was cancelled")
+                        
+                        # Check for 429 IMMEDIATELY - BEFORE ANYTHING ELSE
+                        # This must be checked FIRST to prevent any retries
+                        if http_response.status_code == 429:
+                            error_body = http_response.text[:200] if http_response.text else "No error body"
+                            logger.error(f"🚫🚫🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO SDK RETRIES, moving to next model NOW!")
+                            logger.error(f"🚫 Rate limit detected - Status Code: 429, Error: {error_body}")
+                            logger.error(f"🛑 IMMEDIATELY raising RateLimitError - NO DELAYS, NO RETRIES!")
+                            # Use SimpleRateLimitError for direct HTTP calls (doesn't require SDK parameters)
+                            raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: HTTP 429")
+                        
+                        # Raise for other HTTP errors (non-429)
+                        if http_response.status_code >= 400:
+                            error_body = http_response.text[:500] if http_response.text else "No error body"
+                            status_code = http_response.status_code
+                            
+                            logger.error(f"=" * 80)
+                            logger.error(f"❌ HTTP ERROR on {model_config['name']}")
+                            logger.error(f"=" * 80)
+                            logger.error(f"📊 HTTP Status Code: {status_code}")
+                            logger.error(f"📊 Error Body: {error_body}")
+                            logger.error(f"📊 Endpoint: {api_url}")
+                            logger.error(f"📊 Model: {model_config['name']}")
+                            logger.error(f"📊 Deployment: {model_config['deployment']}")
+                            
+                            if status_code == 400:
+                                logger.error(f"📊 Reason: Bad Request - Invalid request format or parameters")
+                                logger.error(f"📊 Possible causes:")
+                                logger.error(f"   - Deployment '{model_config['deployment']}' does not exist")
+                                logger.error(f"   - Deployment exists but is not configured for chat completions")
+                                logger.error(f"   - API version mismatch (current: {model_config['api_version']})")
+                                logger.error(f"   - Invalid payload format for this deployment")
+                            elif status_code == 401:
+                                logger.error(f"📊 Reason: Unauthorized - Invalid API key or authentication")
+                            elif status_code == 404:
+                                logger.error(f"📊 Reason: Not Found - Deployment '{model_config['deployment']}' not found")
+                                logger.error(f"📊 Action: This deployment does not exist in your Azure OpenAI resource")
+                                logger.error(f"📊 Check Azure Portal to verify deployment exists")
+                            elif status_code == 500:
+                                logger.error(f"📊 Reason: Internal Server Error - Azure OpenAI server error")
+                            else:
+                                logger.error(f"📊 Reason: HTTP {status_code} error")
+                            
+                            logger.error(f"=" * 80)
+                            http_response.raise_for_status()
+                        
+                        # Parse the response
+                        response_data = http_response.json()
+                        response_content = response_data["choices"][0]["message"]["content"]
+                        
+                    except httpx.HTTPError as e:
+                        error_str = str(e).lower()
+                        if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
+                            logger.error(f"🚫🚫🚫 HTTP Error contains rate limit - IMMEDIATELY raising RateLimitError!")
+                            raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: HTTP error: {str(e)}")
+                        
+                        logger.error(f"=" * 80)
+                        logger.error(f"❌ HTTP ERROR EXCEPTION on {model_config['name']}")
+                        logger.error(f"=" * 80)
+                        logger.error(f"📊 Error Type: {type(e).__name__}")
+                        logger.error(f"📊 Error Message: {str(e)[:500]}")
+                        logger.error(f"📊 Full Error: {str(e)}")
+                        logger.error(f"=" * 80)
+                        raise Exception(f"HTTP error on {model_config['name']}: {str(e)}")
+                
+                logger.info(f"✅ Successfully received response from {model_config['name']} ({model_config['deployment']})")
+            except (RateLimitError, SimpleRateLimitError) as e:
+                logger.error(f"🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO delays, moving to next model NOW!")
+                logger.warning(f"❌ Rate limit error (429) in send_message for {model_config['name']}: {str(e)}")
+                logger.warning("⚠️ Azure OpenAI rate limit exceeded. Canceling this model and trying next model immediately.")
+                raise  # Re-raise to let the caller handle retries with next model
             except Exception as e:
                 error_str = str(e).lower()
                 if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                    logger.error(f"❌ Rate limit detected in send_message: {str(e)}")
-                    logger.warning("⚠️ Azure OpenAI rate limit exceeded. Consider reducing request frequency.")
-                raise  # Re-raise to let the caller handle it
+                    logger.error(f"🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO delays, moving to next model NOW!")
+                    logger.error(f"❌ Rate limit detected in send_message for {model_config['name']}: {str(e)}")
+                    logger.warning("⚠️ Azure OpenAI rate limit exceeded. Canceling this model and trying next model immediately.")
+                    # Re-raise as SimpleRateLimitError for consistent handling (doesn't require SDK parameters)
+                    raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: {str(e)}")
+                raise  # Re-raise other errors
             
             # Add assistant response to conversation
-            self.conversations[thread_id].append({
+            self.conversations[conversation_key].append({
                 "role": "assistant",
                 "content": response_content
             })
             
+            logger.info(f"🔓 Completed call to model: {model_config['name']}")
             return response_content
             
         except Exception as e:
@@ -445,8 +527,11 @@ class AzureOpenAIService:
     def validate_response_detail(self, response: str, question_type: str = "day_description") -> Dict[str, Any]:
         """Validate if a response is detailed enough and provide suggestions"""
         try:
-            if not self._initialized:
-                self._initialize_client()
+            # Get model configuration (use first model as primary)
+            model_config = self._get_model_config(self.deployment)
+            
+            # Create client for this specific model
+            client, _ = self._create_client_for_model(self.deployment)
             
             # Create a validation prompt based on question type
             if question_type == "day_description":
@@ -488,8 +573,8 @@ CRITICAL: Return only valid JSON. Do not include any text before or after the JS
 """
             
             # Get validation from Azure OpenAI
-            validation_response = self.client.chat.completions.create(
-                model=self.deployment,
+            validation_response = client.chat.completions.create(
+                model=model_config["deployment"],
                 messages=[
                     {
                         "role": "system",
@@ -500,7 +585,7 @@ CRITICAL: Return only valid JSON. Do not include any text before or after the JS
                         "content": validation_prompt
                     }
                 ],
-                max_tokens=400,
+                max_tokens=500,
                 temperature=0.3,
                 top_p=0.95,
                 frequency_penalty=0,
@@ -967,27 +1052,27 @@ ai_prescreener = None
 alert_system = None
 mobile_service = None
 
-def initialize_ai_prescreener():
-    """Initialize AI Prescreener components"""
-    global ai_prescreener, alert_system, mobile_service
+# def initialize_ai_prescreener():
+#     """Initialize AI Prescreener components"""
+#     global ai_prescreener, alert_system, mobile_service
     
-    try:
-        from ai_prescreener import AIPrescreenerCore
-        from database_schema import db_manager
-        from alert_system import RealTimeAlertSystem
-        from mobile_integration import MobileAIPrescreenerService
+#     try:
+#         from ai_prescreener import AIPrescreenerCore
+#         # from database_schema import db_manager
+#         # from alert_system import RealTimeAlertSystem
+#         # from mobile_integration import MobileAIPrescreenerService
         
-        ai_prescreener = AIPrescreenerCore(azure_service)
-        alert_system = RealTimeAlertSystem(db_manager)
-        mobile_service = MobileAIPrescreenerService()
+#         ai_prescreener = AIPrescreenerCore(azure_service)
+#         alert_system = RealTimeAlertSystem(db_manager)
+#         mobile_service = MobileAIPrescreenerService()
         
-        print("✅ AI Prescreener system initialized successfully")
-    except Exception as e:
-        print(f"⚠️ AI Prescreener initialization failed: {str(e)}")
-        print("⚠️ Some features may not be available")
+#         print("✅ AI Prescreener system initialized successfully")
+#     except Exception as e:
+#         print(f"⚠️ AI Prescreener initialization failed: {str(e)}")
+#         print("⚠️ Some features may not be available")
 
-# Initialize on startup
-initialize_ai_prescreener()
+# # Initialize on startup
+# initialize_ai_prescreener()
 
 # Answer validation functions
 def check_meaningful_modification(original: str, current: str) -> dict:
@@ -1135,13 +1220,19 @@ MUST be grammatically complete and ready to use immediately"""
         logger.error(f"❌ Failed to generate suggested answer: {e}")
         return ""
 
-async def validate_answer_with_ai(user_answer: str, question_guardrail: str = None, q41_guardrail: str = None) -> Dict[str, Any]:
+async def validate_answer_with_ai(user_answer: str, question_guardrail: str = None, q41_guardrail: str = None, request_id: str = None) -> Dict[str, Any]:
     """
     Validate answer using AI model with dynamic guardrails - NO HARDCODED RULES
     
     This function uses AI to intelligently validate the user's answer against:
     1. Question-specific guardrails (what the question requires)
     2. Q41 guardrails (word count and general requirements)
+    
+    Args:
+        user_answer: The user's answer to validate
+        question_guardrail: Question-specific guardrail requirements
+        q41_guardrail: Q41 word count and general requirements
+        request_id: Optional request ID for tracking and cancellation
     
     Returns dynamic validation results based on actual content analysis.
     """
@@ -1167,53 +1258,6 @@ async def validate_answer_with_ai(user_answer: str, question_guardrail: str = No
         raise ValueError("Q41 guardrail must be provided from frontend")
     
     try:
-        # Cache key for identical validations (user answer + guardrails)
-        global _validation_cache
-        try:
-            _validation_cache
-        except NameError:
-            _validation_cache = TTLCache(maxsize=200, ttl_seconds=300)
-
-        cache_key = json.dumps({
-            "ua": user_answer,
-            "qg": question_guardrail,
-            "q41": q41_guardrail
-        }, sort_keys=True)
-        cached = _validation_cache.get(cache_key)
-        if cached:
-            logger.info("🗄️ Cache hit for validation; skipping model call")
-            return cached
-        # Fast path: short-circuit obviously too-short answers to avoid model calls
-        min_chars_required = 0
-        import re as _re
-        if q41_guardrail:
-            # Extract first integer found in guardrail like "Enter minimum 25 characters"
-            m = _re.search(r"(\d+)", q41_guardrail)
-            if m:
-                min_chars_required = int(m.group(1))
-        if min_chars_required and len(user_answer.strip()) < min_chars_required:
-            logger.info("🔎 Short-circuit: below min characters; skipping model call")
-            suggested = await generate_suggested_answer(
-                user_answer=user_answer,
-                question_guardrail=question_guardrail,
-                q41_guardrail=q41_guardrail,
-                missing_elements=["Ensure the response meets the minimum word count"],
-                analysis="Add more detail to meet the length requirement."
-            )
-            return {
-                "word_count": word_count,
-                "missing_elements": ["Ensure the response meets the minimum word count"],
-                "safety_concerns": [],
-                "guidelines_checked": [
-                    "Question-specific requirements (rule-based)",
-                    "Q41 general requirements (rule-based)"
-                ],
-                "ai_analysis": "Answer is below minimum character requirement.",
-                "word_count_analysis": f"Below minimum of {min_chars_required} characters.",
-                "content_quality": "Too brief to assess.",
-                "suggested_answer": suggested
-            }
-
         # Create AI prompt for validation
         validation_prompt = f"""
 You are a helpful guide helping a care worker complete their shift notes. Be supportive, clear, and specific. Help them improve their answer, don't criticize it.
@@ -1279,22 +1323,50 @@ VALIDATION RULES:
    
 3. "review" - Safety/health concern detected (triggers incident form)
 
-REVIEW RULES (MANDATORY):
-- Set "status": "review" and include a non-empty "safety_concerns" list when the answer indicates any potential safety/health incident, including but not limited to:
-  • fall, slip, trip, head injury, loss of consciousness, fainting
-  • injury, bleeding, burn, fracture, choking, seizure
-  • medication error, missed dose that caused risk, overdose
-  • abuse, neglect, elopement/wandering, missing person
-  • aggression/violence requiring intervention, restraint, property damage
-  • police/EMS/911 called, ambulance, ER/hospital visit
-  • any serious hazard or emergency requiring escalation
+🚨🚨🚨 CRITICAL EMERGENCY DETECTION - READ THIS FIRST 🚨🚨🚨
 
-- When setting review:
-  • Populate "safety_concerns" with concise labels (e.g., ["fall"], ["seizure"], ["medication_error"], ["911_called"]).
-  • Keep labels generic and professional; do NOT fabricate details beyond the user’s text.
-  • Still provide a complete "suggested_answer" that is safe and professional.
+REVIEW RULES (MANDATORY - NO EXCEPTIONS):
+⚠️ YOU MUST SET "status": "review" if the answer contains ANY of these emergency indicators:
+  • Fall, fell, falling, slip, slipped, trip, tripped, head injury, hit head, bumped head
+  • Loss of consciousness, fainted, passed out, unconscious, blackout
+  • Injury, injured, bleeding, blood, burn, burned, fracture, broke bone, broken
+  • Choking, choked, seizure, seizures, convulsion, convulsions, fit
+  • Medication error, wrong medication, missed dose, overdose, overdose
+  • Abuse, neglect, assaulted, attacked, hit, hurt, harmed
+  • Elopement, eloped, wandering, wandered, missing, lost, can't find
+  • Aggression, aggressive, violent, violence, hit, punched, kicked, attacked
+  • Restraint, restrained, held down, physical intervention
+  • Property damage, broke, broken, destroyed, damaged
+  • 911, called 911, emergency, emergency services, ambulance, paramedics
+  • ER, emergency room, hospital, urgent care, taken to hospital, transported
+  • Police, cops, law enforcement, authorities called
+  • Any variation or combination of the above terms
 
-- Do NOT set "review" for ordinary illness or minor discomfort (e.g., “client was sick” or “fever”) unless the text clearly implies urgent risk or escalation (e.g., unconscious, severe bleeding, seizure, 911/ER, or similar).
+⚠️ EXAMPLES THAT MUST TRIGGER REVIEW:
+  - "Client fell down" → status: "review", safety_concerns: ["fall"]
+  - "Client had a seizure" → status: "review", safety_concerns: ["seizure"]
+  - "Client injured their arm" → status: "review", safety_concerns: ["injury"]
+  - "Called 911" → status: "review", safety_concerns: ["911_called"]
+  - "Client was bleeding" → status: "review", safety_concerns: ["injury"]
+  - "Client wandered away" → status: "review", safety_concerns: ["elopement"]
+  - "Medication was given incorrectly" → status: "review", safety_concerns: ["medication_error"]
+  - "Client became aggressive and hit staff" → status: "review", safety_concerns: ["aggression"]
+  - "Client lost consciousness" → status: "review", safety_concerns: ["loss_of_consciousness"]
+
+⚠️ WHEN YOU DETECT ANY EMERGENCY CONDITION:
+  1. IMMEDIATELY set "status": "review" (NOT "approve", NOT "reject")
+  2. MUST populate "safety_concerns" with at least one label from the list above
+  3. Use concise, professional labels: ["fall"], ["seizure"], ["injury"], ["911_called"], ["medication_error"], ["elopement"], ["aggression"], ["loss_of_consciousness"], etc.
+  4. Still provide a complete "suggested_answer" that is safe and professional
+  5. Do NOT ignore emergency conditions - they ALWAYS require review
+
+❌ DO NOT set "review" for:
+  - Ordinary illness: "client was sick", "client had a cold", "client had a headache" (unless severe/unconscious)
+  - Minor discomfort: "client was uncomfortable", "client was tired"
+  - Routine care: "client took medication", "client ate lunch"
+  - Positive events: "client had a good day", "client enjoyed activities"
+
+⚠️ WHEN IN DOUBT: If the text mentions any emergency keyword (fall, injury, seizure, 911, hospital, etc.), set "review" status.
 
 CRITICAL - TONE AND MESSAGING (MUST FOLLOW):
 - ALWAYS write in SECOND PERSON: Use "Your answer" or "You need to" - NEVER "The user's answer" or "The answer"
@@ -1401,25 +1473,40 @@ Step 4: Does answer contain relevant information about client/event/situation?
 """
 
         logger.info("🤖 Sending validation request to AI model...")
+        if request_id:
+            logger.info(f"📋 Request ID: {request_id} (tracking enabled for cancellation)")
         
-        # Call AI model for validation
-        # Add an overall timeout to the model call
-        try:
-            response = await asyncio.wait_for(call_ai_model(validation_prompt), timeout=15)
-        except asyncio.TimeoutError:
-            logger.warning("⏳ Validation model call timed out after 15s; returning fallback")
+        # Check if request cancelled before calling AI
+        if request_id and request_tracker.is_cancelled(request_id):
+            logger.warning(f"🚫 Request {request_id} was cancelled before AI call - aborting")
             return {
-                "word_count": word_count,
-                "missing_elements": ["Validation timed out - please try again"],
+                "status": "reject",
+                "missing_elements": ["Request was cancelled"],
                 "safety_concerns": [],
-                "guidelines_checked": [
-                    "Question-specific requirements (timeout)",
-                    "Q41 general requirements (timeout)"
-                ],
-                "ai_analysis": "Validation timed out.",
+                "analysis": "Request was cancelled. Please try again.",
                 "word_count_analysis": "",
                 "content_quality": "",
-                "suggested_answer": ""
+                "suggested_answer": "",
+                "word_count": len(user_answer.split()),
+                "guidelines_checked": []
+            }
+        
+        # Call AI model for validation
+        response = await call_ai_model(validation_prompt, request_id=request_id)
+        
+        # Check if request cancelled after AI call (before parsing)
+        if request_id and request_tracker.is_cancelled(request_id):
+            logger.warning(f"🚫 Request {request_id} was cancelled after AI call - ignoring response")
+            return {
+                "status": "reject",
+                "missing_elements": ["Request was cancelled"],
+                "safety_concerns": [],
+                "analysis": "Request was cancelled. Please try again.",
+                "word_count_analysis": "",
+                "content_quality": "",
+                "suggested_answer": "",
+                "word_count": len(user_answer.split()),
+                "guidelines_checked": []
             }
         
         logger.info("🤖 AI Response received:")
@@ -1537,10 +1624,11 @@ Step 4: Does answer contain relevant information about client/event/situation?
                 )
             
             # Ensure required fields exist
+            final_safety_concerns = validation_data.get("safety_concerns", [])
             result = {
                 "word_count": word_count,
                 "missing_elements": validation_data.get("missing_elements", []),
-                "safety_concerns": validation_data.get("safety_concerns", []),
+                "safety_concerns": final_safety_concerns,
                 "guidelines_checked": [
                     "Question-specific requirements (AI analyzed)",
                     "Q41 general requirements (AI analyzed)"
@@ -1556,9 +1644,12 @@ Step 4: Does answer contain relevant information about client/event/situation?
             logger.info("=" * 60)
             logger.info(f"📝 FINAL SUGGESTED ANSWER: '{suggested_answer}'")
             logger.info(f"📝 SUGGESTED ANSWER LENGTH: {len(suggested_answer)}")
+            logger.info(f"🚨 FINAL SAFETY CONCERNS: {final_safety_concerns}")
+            if final_safety_concerns:
+                logger.warning(f"🚨 FINAL STATUS WILL BE: review (safety concerns detected)")
+            else:
+                logger.info(f"✅ FINAL STATUS: {validation_data.get('status', 'not set')}")
             
-            # Store in cache before returning
-            _validation_cache.set(cache_key, result)
             return result
             
         except json.JSONDecodeError as e:
@@ -1591,92 +1682,322 @@ Step 4: Does answer contain relevant information about client/event/situation?
             "content_quality": "Unable to assess due to error"
         }
 
-async def call_ai_model(prompt: str, max_retries: int = 3) -> str:
+async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int = 60, request_id: str = None) -> str:
     """
-    Call Azure OpenAI model for validation analysis with rate limiting
+    Call Azure OpenAI model for validation analysis with automatic fallback
+    Tries multiple models ONE AT A TIME (sequential) - waits for each model to complete before trying next
     
     Args:
         prompt: The prompt to send to the AI model
-        max_retries: Maximum number of retries on rate limit errors
+        max_retries: Maximum number of retries per model (default 1, no retries - just try next model)
+        timeout_seconds: Timeout in seconds per model request (default 60s)
+        request_id: Optional request ID for tracking and cancellation
     """
-    retry_count = 0
+    # Get list of fallback deployments (hardcoded 5 models)
+    deployments_to_try = azure_service.fallback_deployments.copy()
     last_error = None
+    model_attempts = []  # Track each model attempt for summary
     
-    while retry_count <= max_retries:
-        try:
-            # Use rate limiter to prevent hitting rate limits
-            async with rate_limiter:
-                # Log only on retries to reduce noise
-                if retry_count > 0:
-                    logger.warning(f"⏳ Retrying Azure OpenAI call... (attempt {retry_count + 1}/{max_retries + 1})")
+    # Check if request is cancelled before starting
+    if request_id and request_tracker.is_cancelled(request_id):
+        logger.warning(f"🚫 Request {request_id} is already cancelled - aborting model fallback")
+        return """{"status": "reject", "missing_elements": ["Request was cancelled"], "safety_concerns": [], "analysis": "Request was cancelled.", "word_count_analysis": "", "content_quality": ""}"""
+    
+    # Check if request is too old (late request)
+    if request_id and request_tracker.is_too_old(request_id):
+        logger.warning(f"⏰ Request {request_id} is too old - ignoring late request")
+        return """{"status": "reject", "missing_elements": ["Request expired"], "safety_concerns": [], "analysis": "Request expired. Please try again.", "word_count_analysis": "", "content_quality": ""}"""
+    
+    logger.info(f"🔄 Starting sequential model fallback. Available models: {deployments_to_try}")
+    logger.info(f"📋 Will try models ONE AT A TIME in this order: 1) {deployments_to_try[0]}, 2) {deployments_to_try[1]}, 3) {deployments_to_try[2]}, 4) {deployments_to_try[3]}, 5) {deployments_to_try[4]}")
+    logger.info(f"⚠️ IMPORTANT: If first model succeeds, will NOT try other models!")
+    logger.info(f"⚠️ IMPORTANT: If first model errors, will IMMEDIATELY cancel and try next model!")
+    if request_id:
+        logger.info(f"📋 Request ID: {request_id} (tracking enabled)")
+    
+    # Try each deployment in order - ONE AT A TIME
+    # Exit immediately if first model succeeds
+    for deployment_idx, deployment in enumerate(deployments_to_try):
+        # Check if request cancelled before trying each model
+        if request_id and request_tracker.is_cancelled(request_id):
+            logger.warning(f"🚫 Request {request_id} cancelled during fallback - aborting")
+            break
+        logger.info(f"=" * 80)
+        logger.info(f"🤖 [MODEL {deployment_idx + 1}/{len(deployments_to_try)}] Attempting: {deployment}")
+        logger.info(f"=" * 80)
+        logger.info(f"📋 Starting attempt for model: {deployment}")
+        logger.info(f"📋 Previous attempts: {len(model_attempts)} models tried so far")
+        if model_attempts:
+            logger.info(f"📋 Previous results:")
+            for attempt in model_attempts:
+                status_icon = "✅" if attempt["status"] == "success" else "❌"
+                logger.info(f"   {status_icon} {attempt['model']}: {attempt['status']} - {attempt.get('message', 'N/A')[:50]}")
+        logger.info(f"=" * 80)
+        
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                # Call Azure OpenAI with specific deployment - AWAIT ensures this completes before next model
+                logger.info(f"📞 Calling {deployment}... (attempt {retry_count + 1}/{max_retries + 1})")
                 
-                # Use your existing Azure OpenAI service with proper parameters
-                # Create a thread for this validation request
-                thread_id = "validation-thread"
-                response = azure_service.send_message(thread_id, prompt)
+                # Create a thread for this validation request (unique per deployment)
+                thread_id = f"validation-thread-{deployment}"
                 
-                logger.info("🤖 Azure OpenAI response received")
+                # Check if request cancelled before making call
+                if request_id and request_tracker.is_cancelled(request_id):
+                    logger.warning(f"🚫 Request {request_id} cancelled before calling {deployment} - aborting")
+                    break
+                
+                # AWAIT ensures this model call completes (success or failure) before moving to next model
+                # Add timeout to prevent hanging requests
+                try:
+                    response = await asyncio.wait_for(
+                        azure_service.send_message(thread_id, prompt, deployment=deployment, request_id=request_id),
+                        timeout=timeout_seconds
+                    )
+                    
+                    # Check if request cancelled after getting response (but before returning)
+                    if request_id and request_tracker.is_cancelled(request_id):
+                        logger.warning(f"🚫 Request {request_id} was cancelled after getting response from {deployment} - ignoring response")
+                        # Don't return - continue to next model or fallback
+                        if deployment_idx < len(deployments_to_try) - 1:
+                            break  # Try next model
+                        else:
+                            break  # All models tried
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"⏰ {deployment} timed out after {timeout_seconds} seconds")
+                    # Track timeout failure
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Timeout after {timeout_seconds} seconds"
+                    })
+                    # Check if cancelled during timeout
+                    if request_id and request_tracker.is_cancelled(request_id):
+                        logger.warning(f"🚫 Request {request_id} cancelled during timeout - aborting")
+                        break
+                    raise Exception(f"Request to {deployment} timed out after {timeout_seconds}s")
+                
+                # CRITICAL: If we get here, the model responded successfully
+                # Exit immediately - DO NOT try next models
+                if response and len(str(response).strip()) > 0:
+                    logger.info(f"✅ SUCCESS! Received valid response from {deployment}")
+                    logger.info(f"🎯 Using response from model: {deployment}")
+                    logger.info(f"🛑 EXITING IMMEDIATELY - First model succeeded! NOT trying other models!")
+                    logger.info(f"✋ STOPPING fallback process - response received from model {deployment_idx + 1}")
+                    
+                    # Track successful attempt
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "success",
+                        "message": "Successfully received response"
+                    })
+                    
+                    # Print summary of all attempts
+                    logger.info(f"=" * 80)
+                    logger.info(f"📊 MODEL ATTEMPT SUMMARY")
+                    logger.info(f"=" * 80)
+                    for i, attempt in enumerate(model_attempts, 1):
+                        status_icon = "✅" if attempt["status"] == "success" else "❌"
+                        logger.info(f"{status_icon} Model {i}: {attempt['model']} - {attempt['status']} - {attempt.get('message', 'N/A')}")
+                    logger.info(f"=" * 80)
+                    
+                    # CRITICAL: Return immediately - this exits the entire function
+                    # No other models will be tried after this return
                 return response
-                
-        except RateLimitError as e:
+                else:
+                    # Empty response - treat as error and try next model
+                    logger.warning(f"⚠️ {deployment} returned empty response. Trying next model...")
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": "Empty response from model"
+                    })
+                    break  # Break inner loop to try next deployment
+                    
+            except (RateLimitError, SimpleRateLimitError) as e:
             retry_count += 1
             last_error = e
-            rate_limiter.on_rate_limit_hit()
+                
+                logger.error(f"=" * 80)
+                logger.error(f"🚫 RATE LIMIT ERROR on {deployment}")
+                logger.error(f"=" * 80)
+                logger.error(f"📊 Error Type: {type(e).__name__}")
+                logger.error(f"📊 Error Message: {str(e)}")
+                logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
+                logger.error(f"📊 HTTP Status: 429 Too Many Requests")
+                logger.error(f"📊 Reason: Azure OpenAI rate limit exceeded for {deployment}")
+                logger.error(f"=" * 80)
+                
+                # Track failed attempt
+                if retry_count > max_retries:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Rate limit (429) - exhausted {max_retries} retries"
+                    })
             
-            if retry_count <= max_retries:
-                # Honor Retry-After header if available; otherwise exponential backoff with jitter
-                retry_after = None
-                try:
-                    # Azure SDK exceptions may carry response/headers
-                    resp = getattr(e, 'response', None)
-                    headers = getattr(resp, 'headers', {}) if resp else {}
-                    retry_after = headers.get('Retry-After') or headers.get('retry-after')
-                except Exception:
-                    retry_after = None
-                if retry_after:
-                    try:
-                        wait_time = float(retry_after)
-                    except ValueError:
-                        wait_time = min(2 ** retry_count, 30)
+                if retry_count <= max_retries:
+                    # If Azure rate limits on this model, try again immediately (no wait)
+                    logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
+                    continue
                 else:
-                    import random as _rnd
-                    wait_time = min(2 ** retry_count, 30) + _rnd.uniform(0, 0.5)
-                logger.warning(f"⏳ Rate limit hit (429). Waiting {wait_time:.1f}s before retry {retry_count}/{max_retries}")
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"❌ Rate limit exceeded after {max_retries} retries")
-                raise
+                    # If this model exhausted retries, cancel and try next deployment immediately
+                    logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
+                    break  # Break inner loop - cancel remaining retries and try next deployment
         
         except Exception as e:
             last_error = e
-            logger.error(f"❌ AZURE OPENAI CALL ERROR: {str(e)}")
-            logger.error(f"❌ Error type: {type(e).__name__}")
+            error_str = str(e).lower()
             
             # Check if it's a rate limit error by status code
-            error_str = str(e).lower()
             if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
                 retry_count += 1
-                rate_limiter.on_rate_limit_hit()
+                
+                logger.error(f"=" * 80)
+                logger.error(f"🚫 RATE LIMIT DETECTED on {deployment}")
+                logger.error(f"=" * 80)
+                logger.error(f"📊 Error Type: {type(e).__name__}")
+                logger.error(f"📊 Error Message: {str(e)[:500]}")
+                logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
+                logger.error(f"📊 HTTP Status: 429 (detected in error message)")
+                logger.error(f"=" * 80)
                 
                 if retry_count <= max_retries:
-                    # No direct headers; use jittered backoff
-                    import random as _rnd
-                    wait_time = min(2 ** retry_count, 30) + _rnd.uniform(0, 0.5)
-                    logger.warning(f"⏳ Rate limit detected. Waiting {wait_time:.1f}s before retry {retry_count}/{max_retries}")
-                    await asyncio.sleep(wait_time)
+                    # If Azure rate limits, try again immediately (no wait)
+                    logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
                     continue
+                else:
+                    # If this model exhausted retries, cancel and try next deployment immediately
+                    logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
+                    break  # Break inner loop - cancel remaining retries and try next deployment
+            else:
+                # Non-rate-limit error - Log detailed error information
+                logger.error(f"=" * 80)
+                logger.error(f"❌ MODEL FAILURE on {deployment}")
+                logger.error(f"=" * 80)
+                logger.error(f"📊 Error Type: {type(e).__name__}")
+                logger.error(f"📊 Error Message: {str(e)[:500]}")
+                logger.error(f"📊 Full Error: {str(e)}")
+                
+                # Check for specific error types
+                if "400" in error_str or "bad request" in error_str:
+                    logger.error(f"📊 HTTP Status: 400 Bad Request")
+                    logger.error(f"📊 Reason: Invalid request format or parameters for {deployment}")
+                elif "404" in error_str or "not found" in error_str:
+                    logger.error(f"📊 HTTP Status: 404 Not Found")
+                    logger.error(f"📊 Reason: Deployment '{deployment}' not found in Azure OpenAI")
+                elif "401" in error_str or "unauthorized" in error_str:
+                    logger.error(f"📊 HTTP Status: 401 Unauthorized")
+                    logger.error(f"📊 Reason: Invalid API key or authentication failed")
+                elif "500" in error_str or "internal server error" in error_str:
+                    logger.error(f"📊 HTTP Status: 500 Internal Server Error")
+                    logger.error(f"📊 Reason: Azure OpenAI server error")
+                else:
+                    logger.error(f"📊 HTTP Status: Unknown")
+                    logger.error(f"📊 Reason: {str(e)[:200]}")
+                
+                logger.error(f"=" * 80)
+                
+                # Track failed attempt
+                error_message = str(e)[:200] if str(e) else "Unknown error"
+                if "400" in error_str or "bad request" in error_str:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Bad Request (400) - {error_message}"
+                    })
+                elif "404" in error_str or "not found" in error_str:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Not Found (404) - Deployment not found"
+                    })
+                elif "401" in error_str or "unauthorized" in error_str:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Unauthorized (401) - Authentication failed"
+                    })
+                elif "500" in error_str or "internal server error" in error_str:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Server Error (500) - {error_message}"
+                    })
+                else:
+                    model_attempts.append({
+                        "model": deployment,
+                        "status": "failed",
+                        "message": f"Error - {error_message}"
+                    })
+                
+                # Non-rate-limit error - IMMEDIATELY cancel and try next deployment
+                # Don't retry - just move to next model immediately
+                logger.warning(f"🛑 Canceling {deployment} - NOT retrying. Moving to next model immediately...")
+                break  # Break inner loop immediately - cancel any retries, try next model
+        
+        # If we get here, this deployment failed - try next one (if available)
+        # CANCEL current model and wait 10 seconds before trying next model
+        # This delay ensures any in-flight requests fully fail/cancel before trying next model
+        # This prevents late responses from causing issues on the frontend
+        # Also allows time to see each model's logs and understand why it failed
+        if deployment_idx < len(deployments_to_try) - 1:
+            next_model = deployments_to_try[deployment_idx + 1]
+            logger.info(f"=" * 80)
+            logger.info(f"🔄 {deployment} FAILED - Moving to next model")
+            logger.info(f"=" * 80)
+            logger.info(f"📊 FAILURE SUMMARY for {deployment}:")
+            logger.info(f"   - Status: Failed or Rate Limited")
+            logger.info(f"   - Last Error: {str(last_error)[:200] if last_error else 'Unknown'}")
+            logger.info(f"   - Retries Attempted: {retry_count}")
+            logger.info(f"🚫 Previous request to {deployment} has been canceled/abandoned")
+            logger.info(f"⏳ Waiting 10 seconds before trying {next_model}...")
+            logger.info(f"   This allows time to see {deployment} logs and ensure cancellation")
+            logger.info(f"=" * 80)
             
-            # Non-rate-limit errors: return fallback after retries
-            if retry_count >= max_retries:
+            # Wait 10 seconds to ensure any in-flight request fully cancels/fails
+            # This prevents late responses from causing duplicate responses on frontend
+            # Also allows time to review logs for each model
+            for wait_second in range(1, 11):
+                await asyncio.sleep(1)
+                if wait_second % 2 == 0:  # Log every 2 seconds
+                    logger.info(f"⏳ Waiting... ({wait_second}/10 seconds)")
+            
+            logger.info(f"=" * 80)
+            logger.info(f"➡️ NOW Starting request to {next_model} after 10 second delay...")
+            logger.info(f"=" * 80)
+            continue
+        else:
+            # All deployments exhausted - Print final summary
+            logger.error(f"=" * 80)
+            logger.error(f"❌ ALL MODELS EXHAUSTED")
+            logger.error(f"=" * 80)
+            logger.error(f"📊 Total Models Tried: {len(deployments_to_try)}")
+            logger.error(f"📊 Successful Models: {len([a for a in model_attempts if a['status'] == 'success'])}")
+            logger.error(f"📊 Failed Models: {len([a for a in model_attempts if a['status'] == 'failed'])}")
+            logger.error(f"=" * 80)
+            logger.error(f"📊 DETAILED SUMMARY OF ALL MODEL ATTEMPTS:")
+            logger.error(f"=" * 80)
+            for i, attempt in enumerate(model_attempts, 1):
+                status_icon = "✅" if attempt["status"] == "success" else "❌"
+                logger.error(f"{status_icon} Model {i}: {attempt['model']}")
+                logger.error(f"   Status: {attempt['status']}")
+                logger.error(f"   Message: {attempt.get('message', 'N/A')}")
+            logger.error(f"=" * 80)
+            logger.error(f"❌ All {len(deployments_to_try)} models exhausted - no more models to try")
+            logger.error(f"❌ Last Error: {str(last_error)[:200] if last_error else 'Unknown'}")
+            logger.error(f"=" * 80)
                 break
-            retry_count += 1
     
-    # Fallback response if AI fails after all retries
+    # Fallback response if all models fail after all retries
     fallback_response = """{"status": "reject", "missing_elements": ["Unable to validate due to AI service error - please try again"], "safety_concerns": [], "analysis": "AI validation service temporarily unavailable. Please try again.", "word_count_analysis": "Unable to analyze due to service error", "content_quality": "Unable to assess due to service error"}"""
     
-    logger.warning(f"⚠️ Using fallback response due to AI service error (after {retry_count} attempts)")
+    logger.warning(f"⚠️ All models failed. Using fallback response")
     if last_error:
-        logger.warning(f"⚠️ Last error: {str(last_error)}")
+        logger.warning(f"⚠️ Last error from models: {str(last_error)[:200]}")
     
     return fallback_response
 
@@ -1781,7 +2102,7 @@ async def create_thread():
 async def send_message(request: MessageRequest):
     """Send a message to Azure OpenAI"""
     try:
-        response = azure_service.send_message(request.thread_id, request.message)
+        response = await azure_service.send_message(request.thread_id, request.message)
         
         return MessageResponse(
             success=True,
@@ -1845,15 +2166,6 @@ async def validate_service_relevance(request: ServiceValidationRequest):
         logger.error(f"Error validating service relevance: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error validating service relevance: {str(e)}")
 
-@app.post("/chatbot/ask", response_model=ChatbotResponse)
-async def ask_chatbot(request: ChatbotRequest):
-    """Handle chatbot questions with context-aware responses"""
-    try:
-        response = azure_service.ask_chatbot(request.message, request.context)
-        return ChatbotResponse(response=response)
-    except Exception as e:
-        logger.error(f"Error in chatbot: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error in chatbot: {str(e)}")
 
 @app.post("/prescreener/validate-strict", response_model=PrescreenerResponse)
 async def prescreener_validate_strict(request: PrescreenerRequest):
@@ -1986,219 +2298,6 @@ async def speech_to_text(request: dict):
     except Exception as e:
         logger.error(f"❌ SPEECH-TO-TEXT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in speech-to-text: {str(e)}")
-
-@app.post("/speech-to-text-streaming")
-async def speech_to_text_streaming(request: dict):
-    """
-    Convert speech audio to text with streaming support for real-time experience
-    
-    Accepts base64 encoded audio chunks and returns transcribed text
-    Optimized for shorter audio segments for better real-time feel
-    """
-    import base64
-    import tempfile
-    import os
-    
-    try:
-        audio_data = request.get("audio_data")
-        audio_format = request.get("format", "m4a")
-        chunk_id = request.get("chunk_id", 0)
-        
-        if not audio_data:
-            raise HTTPException(status_code=400, detail="No audio data provided")
-        
-        logger.info(f"🎤 STREAMING SPEECH-TO-TEXT - Chunk {chunk_id} ({len(audio_data)} bytes base64)")
-        
-        # Decode base64 audio
-        audio_bytes = base64.b64decode(audio_data)
-        logger.info(f"🎤 Decoded audio chunk: {len(audio_bytes)} bytes")
-        
-        # Save to temporary file
-        with tempfile.NamedTemporaryFile(suffix=f"_chunk_{chunk_id}.{audio_format}", delete=False) as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_audio_path = temp_audio.name
-            logger.info(f"🎤 Saved chunk to temp file: {temp_audio_path}")
-        
-        try:
-            # Use Azure OpenAI for Whisper (same credentials as GPT-4)
-            whisper_deployment = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
-            whisper_endpoint = os.getenv("AZURE_WHISPER_ENDPOINT", "https://hakeem-4411-resource.cognitiveservices.azure.com/openai/deployments/whisper/audio/transcriptions")
-            whisper_key = os.getenv("AZURE_WHISPER_KEY", os.getenv("AZURE_OPENAI_KEY"))
-            whisper_api_version = os.getenv("AZURE_WHISPER_API_VERSION", "2024-06-01")
-            
-            # Create Azure client for Whisper
-            whisper_client = AzureOpenAI(
-                api_key=whisper_key,
-                api_version=whisper_api_version,
-                azure_endpoint="https://hakeem-4411-resource.cognitiveservices.azure.com/"
-            )
-            
-            # Use Azure Cognitive Services Whisper
-            with open(temp_audio_path, "rb") as audio_file:
-                transcription = whisper_client.audio.transcriptions.create(
-                    model=whisper_deployment,
-                    file=audio_file,
-                    language="en"
-                )
-            
-            transcribed_text = transcription.text
-            logger.info(f"✅ STREAMING SPEECH-TO-TEXT - Chunk {chunk_id} Transcription: {transcribed_text}")
-            
-            # Clean up temp file
-            os.unlink(temp_audio_path)
-            
-            return {
-                "success": True,
-                "text": transcribed_text,
-                "chunk_id": chunk_id,
-                "language": "en",
-                "is_final": True  # For now, treat each chunk as final
-            }
-            
-        except Exception as whisper_error:
-            logger.error(f"❌ Streaming Whisper API error: {str(whisper_error)}")
-            # Clean up temp file
-            if os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
-            
-            return {
-                "success": False,
-                "text": "",
-                "chunk_id": chunk_id,
-                "error": "Speech-to-text service temporarily unavailable"
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ STREAMING SPEECH-TO-TEXT ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error in streaming speech-to-text: {str(e)}")
-
-@app.post("/ai-prescreener/analyze-shift")
-async def analyze_shift_with_ai_prescreener(request: dict):
-    """Analyze shift data using AI Prescreener system"""
-    try:
-        if ai_prescreener is None:
-            raise HTTPException(status_code=503, detail="AI Prescreener system not initialized")
-        
-        # Convert request to ShiftData format
-        from ai_prescreener import ShiftData
-        from datetime import datetime
-        
-        shift_data = ShiftData(
-            shift_id=request.get("shift_id", f"mobile_shift_{datetime.now().timestamp()}"),
-            client_id=request.get("client_id"),
-            worker_id=request.get("worker_id"),
-            shift_date=datetime.fromisoformat(request.get("shift_date", datetime.now().isoformat())),
-            shift_duration_hours=request.get("shift_duration_hours", 8.0),
-            is_overnight_shift=request.get("is_overnight_shift", False),
-            worker_notes=request.get("worker_notes", ""),
-            completed_tasks=request.get("completed_tasks", []),
-            services_provided=request.get("services_provided", []),
-            additional_context=request.get("additional_context", {})
-        )
-        
-        # Perform AI Prescreener analysis
-        result = ai_prescreener.analyze_shift(shift_data)
-        
-        # Process flagged events for alerts if alert system is available
-        if alert_system is not None:
-            for event in result.flagged_events:
-                await alert_system.process_flagged_event(event)
-        
-        return {
-            "success": True,
-            "analysis_id": result.analysis_id,
-            "flagged_events": [
-                {
-                    "event_id": event.event_id,
-                    "event_type": event.event_type.value,
-                    "severity": event.severity.value,
-                    "description": event.description,
-                    "requires_escalation": event.requires_escalation
-                }
-                for event in result.flagged_events
-            ],
-            "compliance_violations": result.compliance_violations,
-            "generated_narrative": result.generated_narrative,
-            "requires_human_review": result.requires_human_review,
-            "confidence_score": result.confidence_score
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in AI Prescreener analysis: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error analyzing shift: {str(e)}")
-
-@app.get("/ai-prescreener/client-safety-summary/{client_id}")
-async def get_client_safety_summary(client_id: str, days: int = 7):
-    """Get safety summary for a client"""
-    try:
-        if mobile_service is None:
-            raise HTTPException(status_code=503, detail="AI Prescreener system not initialized")
-        
-        summary = await mobile_service.get_client_safety_summary(client_id, days)
-        return summary
-    except Exception as e:
-        logger.error(f"Error getting safety summary: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting safety summary: {str(e)}")
-
-@app.post("/ai-prescreener/resolve-event/{event_id}")
-async def resolve_flagged_event(event_id: str, resolved_by: str):
-    """Resolve a flagged event"""
-    try:
-        if mobile_service is None:
-            raise HTTPException(status_code=503, detail="AI Prescreener system not initialized")
-        
-        result = await mobile_service.integration.resolve_flagged_event(event_id, resolved_by)
-        return result
-    except Exception as e:
-        logger.error(f"Error resolving event: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error resolving event: {str(e)}")
-
-@app.get("/ai-prescreener/pending-alerts")
-async def get_pending_alerts(client_id: str = None):
-    """Get pending alerts"""
-    try:
-        if mobile_service is None:
-            raise HTTPException(status_code=503, detail="AI Prescreener system not initialized")
-        
-        alerts = await mobile_service.integration.get_pending_alerts(client_id)
-        return {"alerts": alerts}
-    except Exception as e:
-        logger.error(f"Error getting pending alerts: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error getting pending alerts: {str(e)}")
-
-@app.get("/ai-prescreener/system-status")
-async def get_ai_prescreener_status():
-    """Get AI Prescreener system status"""
-    try:
-        if mobile_service is None:
-            return {
-                "system_status": "unhealthy",
-                "ai_prescreener_status": "inactive",
-                "alert_system_status": "inactive",
-                "database_status": "unhealthy",
-                "error": "AI Prescreener system not initialized"
-            }
-        
-        # Simple status check without complex integration
-        return {
-            "system_status": "healthy",
-            "ai_prescreener_status": "active" if ai_prescreener else "inactive",
-            "alert_system_status": "active" if alert_system else "inactive",
-            "database_status": "healthy",
-            "total_clients": 1,
-            "total_flagged_events": 0,
-            "pending_alerts": 0,
-            "last_analysis": None
-        }
-    except Exception as e:
-        logger.error(f"Error getting system status: {str(e)}")
-        return {
-            "system_status": "unhealthy",
-            "ai_prescreener_status": "inactive",
-            "alert_system_status": "inactive",
-            "database_status": "unhealthy",
-            "error": str(e)
-        }
 
 # AI Prescreener endpoints
 class ConflictDetectionRequest(BaseModel):
@@ -2572,7 +2671,7 @@ def extract_concepts_from_message(message: str) -> List[str]:
 
 # Answer validation API endpoint
 @app.post("/validate-answer", response_model=AnswerValidationResponse)
-async def validate_answer(request: AnswerValidationRequest, http_request: Request):
+async def validate_answer(request: AnswerValidationRequest):
     """
     Validate answer against question guidelines and Q41 universal guidelines
     
@@ -2582,12 +2681,19 @@ async def validate_answer(request: AnswerValidationRequest, http_request: Reques
     - review: Safety concerns detected (triggers Incident Form)
     """
     try:
+        # Generate or use provided request ID for tracking
+        request_id = request.request_id or str(uuid.uuid4())
+        request_timestamp = request.timestamp or int(time.time() * 1000)
+        
+        # Register request for tracking and cancellation
+        request_tracker.register_request(request_id, request_timestamp)
+        
+        # Cancel any previous requests with same input (deduplication)
+        # This prevents duplicate validation requests from causing issues
+        request_tracker.cleanup_old_requests()
+        
         logger.info(f"🔍 Validating answer")
-        # Per-IP basic throttle to avoid bursts
-        client_ip = http_request.client.host if http_request and http_request.client else "unknown"
-        if not per_ip_limiter.allow(client_ip):
-            logger.warning("🚦 Per-IP rate limit reached; returning 429 with Retry-After")
-            raise HTTPException(status_code=429, detail="Too Many Requests", headers={"Retry-After": "2"})
+        logger.info(f"📋 Request ID: {request_id} (timestamp: {request_timestamp})")
         logger.info(f"📝 Answer: {request.user_answer[:100]}...")
         logger.info(f"📋 Question Guardrail: {request.question_guardrail}")
         logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail}")
@@ -2607,93 +2713,28 @@ async def validate_answer(request: AnswerValidationRequest, http_request: Reques
         if request.ai_suggestion:
             logger.info(f"   - ai_suggestion: '{request.ai_suggestion[:100]}...'")
         
-        # Start background workers if not started
-        _ensure_workers_started(num_workers=2)
-
-        # Build idempotency key from payload (could also accept header)
-        idem_payload = {
-            "ua": request.user_answer,
-            "qg": request.question_guardrail,
-            "q41": request.q41_guardrail,
-            "ver": 1
-        }
-        idem_key = json.dumps(idem_payload, sort_keys=True)
-        cache_key = "val:cache:" + idem_key
-        lock_key = "val:lock:" + idem_key
-
-        # First try Redis cache (cross-instance)
-        cached_dist = await redis_cache_get(cache_key)
-        if cached_dist:
-            logger.info("🗄️ Redis cache hit for validation; returning cached result")
-            validation_result = cached_dist
-        else:
-            # Try to acquire distributed lock to become the leader for this key
-            have_lock = await redis_acquire_lock(lock_key, ttl=20)
-            if not have_lock:
-                # Another instance is computing; poll cache for result up to 12s
-                logger.info("⏳ Waiting for leader result via Redis cache")
-                deadline = asyncio.get_event_loop().time() + 12
-                validation_result = None
-                while asyncio.get_event_loop().time() < deadline:
-                    cached_dist = await redis_cache_get(cache_key)
-                    if cached_dist:
-                        validation_result = cached_dist
-                        break
-                    await asyncio.sleep(0.2)
-                if validation_result is None:
-                    # Fall back to local coalescing path
-                    logger.info("↩️ Falling back to local coalescing path (no cache yet)")
-                    # Coalesce in-flight identical requests locally
-                    fut = _inflight_validations.get(idem_key)
-                    if fut is None:
-                        fut = asyncio.get_event_loop().create_future()
-                        if idem_key in _inflight_validations:
-                            fut = _inflight_validations[idem_key]
-                        else:
-                            if _validation_queue.full():
-                                logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
-                                raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
-                            _inflight_validations[idem_key] = fut
-                            await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
-                    validation_result = await fut
-                # else got result from cache
-            else:
-                # We are the leader: use local coalescing to compute, then set Redis cache
-                fut = _inflight_validations.get(idem_key)
-                if fut is None:
-                    fut = asyncio.get_event_loop().create_future()
-                    if idem_key in _inflight_validations:
-                        fut = _inflight_validations[idem_key]
-                    else:
-                        if _validation_queue.full():
-                            await redis_release_lock(lock_key)
-                            logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
-                            raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
-                        _inflight_validations[idem_key] = fut
-                        await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
-                validation_result = await fut
-                # Store to Redis cache and release lock
-                await redis_cache_set(cache_key, validation_result, ttl=300)
-                await redis_release_lock(lock_key)
-
-        # Coalesce in-flight identical requests
-        fut = _inflight_validations.get(idem_key)
-        if fut is None:
-            # Enqueue if capacity allows
-            fut = asyncio.get_event_loop().create_future()
-            # Double-check race
-            if idem_key in _inflight_validations:
-                fut = _inflight_validations[idem_key]
-            else:
-                # Try to enqueue without waiting when queue is full
-                if _validation_queue.full():
-                    logger.warning("🚧 Validation queue full - rejecting fast with Retry-After")
-                    raise HTTPException(status_code=503, detail="Server busy, please retry shortly", headers={"Retry-After": "2"})
-                _inflight_validations[idem_key] = fut
-                await _validation_queue.put((idem_key, request.user_answer, request.question_guardrail, request.q41_guardrail))
-
-        # Await the shared result
-        # validation_result is set by one of the branches above
+        # Check if request cancelled before validation
+        if request_tracker.is_cancelled(request_id):
+            logger.warning(f"🚫 Request {request_id} was cancelled before validation - aborting")
+            raise HTTPException(status_code=499, detail="Request was cancelled")
+        
+        # Validate answer content using AI model with dynamic guardrails
+        validation_result = await validate_answer_with_ai(
+            request.user_answer,
+            request.question_guardrail,
+            request.q41_guardrail,
+            request_id=request_id
+        )
+        
+        # Check if request cancelled after validation (before returning)
+        if request_tracker.is_cancelled(request_id):
+            logger.warning(f"🚫 Request {request_id} was cancelled after validation - ignoring response")
+            raise HTTPException(status_code=499, detail="Request was cancelled - response ignored")
+        
+        # Check if request too old (late response)
+        if request_tracker.is_too_old(request_id):
+            logger.warning(f"⏰ Request {request_id} is too old - ignoring late response")
+            raise HTTPException(status_code=408, detail="Request expired - please try again")
         
         # CRITICAL: Always check safety concerns FIRST - they override everything
         safety_concerns = validation_result.get("safety_concerns", [])
@@ -2741,7 +2782,8 @@ async def validate_answer(request: AnswerValidationRequest, http_request: Reques
             safety_concerns=validation_result['safety_concerns'],
             word_count=validation_result['word_count'],
             guidelines_checked=validation_result['guidelines_checked'],
-            modification_status=modification_status if request.ai_suggestion else {}  # Include modification status
+            modification_status=modification_status if request.ai_suggestion else {},  # Include modification status
+            request_id=request_id  # Include request ID for frontend tracking
         )
         
         logger.info(f"✅ API Response built successfully with suggested_answer")
