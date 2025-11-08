@@ -73,6 +73,9 @@ class AnswerValidationRequest(BaseModel):
     user_answer: str
     question_guardrail: str = None  # Question-specific guardrail from frontend
     q41_guardrail: str = None  # Q41 guardrail (word count) from frontend
+    master_guardrail: str = None  # Master guardrail (global requirements) from frontend
+    question_word_count: str = None  # Optional: Question-specific word count requirement
+    default_word_count_guardrail: str = None  # Optional: Default word count fallback (Q47)
     ai_suggestion: str = None  # Optional: AI suggestion that user was asked to modify
     request_id: str = None  # Optional: Unique request ID for tracking and cancellation
     timestamp: int = None  # Optional: Request timestamp (milliseconds) for late response detection
@@ -953,7 +956,7 @@ Respond with helpful guidance only, no additional formatting or explanations.
             # Detect safety incidents
             detected_issues = []
             critical_keywords = {
-                "fall": ["fell", "fall", "falling", "fallen", "slipped", "tripped"],
+                "fall": ["fall", "falling", "fallen", "slipped", "tripped"],
                 "fever": ["fever", "temperature", "hot", "burning up", "feverish"],
                 "injury": ["injured", "hurt", "bleeding", "bruise", "cut", "wound"],
                 "medication_error": ["wrong medication", "wrong dose", "missed medication"],
@@ -1213,11 +1216,37 @@ def check_meaningful_modification(original: str, current: str) -> dict:
         "needs_more_changes": not is_valid
     }
 
-async def generate_suggested_answer(user_answer: str, question_guardrail: str, q41_guardrail: str, missing_elements: list, analysis: str) -> str:
+async def generate_suggested_answer(
+    user_answer: str,
+    question_guardrail: str,
+    q41_guardrail: str,
+    missing_elements: list,
+    analysis: str,
+    question_word_count: str = None,
+    default_word_count_guardrail: str = None,
+    master_guardrail: str = None
+) -> str:
     """
     Generate a suggested corrected answer when the AI doesn't provide one.
     """
     logger.info("🎯 Generating suggested answer as fallback...")
+    length_requirement_text = question_word_count or default_word_count_guardrail
+    length_requirement_source = (
+        "question-specific" if question_word_count else
+        "default fallback" if default_word_count_guardrail else
+        "not provided"
+    )
+    length_requirement_display = length_requirement_text or "No specific requirement provided"
+    length_requirement_prompt_value = length_requirement_text or "Not provided"
+    if length_requirement_text:
+        logger.info(f"🧮 Length requirement for suggestion ({length_requirement_source}): {length_requirement_text}")
+    else:
+        logger.info("🧮 Length requirement for suggestion: <not provided>")
+    if master_guardrail:
+        logger.info(f"🛡️ Master guardrail (suggested answer context): {master_guardrail}")
+        logger.info(f"🛡️ Master guardrail length: {len(master_guardrail)} characters")
+    else:
+        logger.info("🛡️ Master guardrail (suggested answer context): <missing>")
     
     try:
         prompt = f"""Generate a complete, corrected version of this answer that meets ALL requirements.
@@ -1228,13 +1257,19 @@ async def generate_suggested_answer(user_answer: str, question_guardrail: str, q
 - Complete all sentences fully - NEVER leave blanks like "engaged in ." or "symptoms such as ."
 - Use generic descriptive words to complete incomplete thoughts
 - NEVER invent specific facts, temperatures, exact times, or specific activities not in the user's original answer
-- Fix grammar, add professional structure, meet word count ({q41_guardrail})
+- Fix grammar, add professional structure, meet word count ({length_requirement_display})
 - Preserve ALL facts and details from the user's answer
 - The answer MUST be complete and grammatically correct - no placeholders, no blanks
 
+GLOBAL MASTER GUARDRAIL (MUST ALWAYS BE FOLLOWED):
+"{master_guardrail if master_guardrail else 'No additional master guardrail provided.'}"
+
+Ensure the final answer follows the question-specific requirements, Q41 guidelines, and the global master guardrail exactly.
+
 Original Answer: "{user_answer}"
 Question Requirements: "{question_guardrail}"
-Length Requirement: "{q41_guardrail}"
+Q41 Guidelines: "{q41_guardrail}"
+Length Requirement ({length_requirement_source.upper()}): "{length_requirement_prompt_value}"
 Missing Elements: {missing_elements}
 What to Add: {analysis}
 
@@ -1246,7 +1281,7 @@ The suggestion must be DERIVATIVE of what the caregiver actually entered, but CO
 - Complete all sentences fully - NEVER leave blanks like "engaged in ." or "symptoms such as ."
 - Use generic descriptive words to complete incomplete thoughts (e.g., "engaged in activities", "displayed various symptoms")
 - NEVER invent specific facts, temperatures, exact times, or specific activities not in the user's original answer
-- Fix grammar, add professional structure, meet word count ({q41_guardrail})
+- Fix grammar, add professional structure, meet word count ({length_requirement_display})
 - Preserve ALL facts, events, and details the user mentioned
 - The answer MUST be complete and grammatically correct - no placeholders, no blanks
 
@@ -1266,7 +1301,7 @@ The suggestion must be DERIVATIVE of what the caregiver actually entered, but CO
 🎯 PRINCIPLE: The suggestion should be COMPLETE and ready to use immediately - what the user would have written with more time and proper format. Complete incomplete thoughts with generic language, but don't invent specific facts.
 
 Return ONLY a single, complete answer (no explanations, no extra text, no blanks, no placeholders)
-MUST meet the length requirement: {q41_guardrail}
+MUST meet the length requirement: {length_requirement_display}
 MUST be grammatically complete and ready to use immediately"""
         
         response = await call_ai_model(prompt)
@@ -1277,13 +1312,23 @@ MUST be grammatically complete and ready to use immediately"""
         logger.error(f"❌ Failed to generate suggested answer: {e}")
         return ""
 
-async def validate_answer_with_ai(user_answer: str, question_guardrail: str = None, q41_guardrail: str = None, request_id: str = None) -> Dict[str, Any]:
+async def validate_answer_with_ai(
+    user_answer: str,
+    question_guardrail: str = None,
+    q41_guardrail: str = None,
+    question_word_count: str = None,
+    default_word_count_guardrail: str = None,
+    master_guardrail: str = None,
+    request_id: str = None
+) -> Dict[str, Any]:
     """
     Validate answer using AI model with dynamic guardrails - NO HARDCODED RULES
     
     This function uses AI to intelligently validate the user's answer against:
     1. Question-specific guardrails (what the question requires)
-    2. Q41 guardrails (word count and general requirements)
+    2. Question-specific word count requirements (if provided)
+    3. Default word count fallback (if provided)
+    4. Q41 guardrails (general professional tone requirements)
     
     Args:
         user_answer: The user's answer to validate
@@ -1300,6 +1345,26 @@ async def validate_answer_with_ai(user_answer: str, question_guardrail: str = No
     logger.info(f"📝 USER ANSWER: '{user_answer}'")
     logger.info(f"📋 QUESTION GUARDRAIL: '{question_guardrail}'")
     logger.info(f"📋 Q41 GUARDRAIL: '{q41_guardrail}'")
+    if question_word_count:
+        logger.info(f"📋 QUESTION WORD COUNT: '{question_word_count}'")
+    else:
+        logger.info("📋 QUESTION WORD COUNT: <not provided>")
+    if default_word_count_guardrail:
+        logger.info(f"📋 DEFAULT WORD COUNT GUARDRAIL: '{default_word_count_guardrail}'")
+    else:
+        logger.info("📋 DEFAULT WORD COUNT GUARDRAIL: <not provided>")
+    if master_guardrail:
+        logger.info(f"📋 MASTER GUARDRAIL: '{master_guardrail}'")
+    else:
+        logger.info("📋 MASTER GUARDRAIL: <not provided>")
+    logger.info("=" * 80)
+    logger.info("🛡️ MASTER GUARDRAIL (AI PIPELINE INPUT)")
+    if master_guardrail:
+        logger.info(f"🛡️ Content: {master_guardrail}")
+        logger.info(f"🛡️ Length: {len(master_guardrail)} characters")
+    else:
+        logger.info("🛡️ Content: <not provided>")
+    logger.info("=" * 80)
     
     # Basic word count for logging
     word_count = len(user_answer.split())
@@ -1313,9 +1378,46 @@ async def validate_answer_with_ai(user_answer: str, question_guardrail: str = No
     if not q41_guardrail:
         logger.error("❌ Q41 GUARDRAIL MISSING")
         raise ValueError("Q41 guardrail must be provided from frontend")
-    
+
+    length_requirement_text = question_word_count or default_word_count_guardrail
+    length_requirement_source = (
+        "question-specific" if question_word_count else
+        "default fallback" if default_word_count_guardrail else
+        "not provided"
+    )
+    length_requirement_display = length_requirement_text or "No specific requirement provided"
+    length_requirement_prompt_value = length_requirement_text or "Not provided"
+    if length_requirement_text:
+        logger.info(f"🧮 EFFECTIVE LENGTH REQUIREMENT ({length_requirement_source}): '{length_requirement_text}'")
+    else:
+        logger.info("🧮 EFFECTIVE LENGTH REQUIREMENT: <not provided>")
+
     try:
         # Create AI prompt for validation
+        master_guardrail_section = ""
+        if master_guardrail:
+            master_guardrail_section = f"""
+
+MASTER REQUIREMENTS (APPLY TO EVERY ANSWER, EVEN IF NOT RESTATED ABOVE):
+"{master_guardrail}"
+"""
+
+        length_requirement_section = ""
+        if length_requirement_text:
+            length_requirement_section = f"""
+
+LENGTH REQUIREMENT ({length_requirement_source.upper()}):
+"{length_requirement_prompt_value}"
+"""
+
+        q41_section = ""
+        if q41_guardrail:
+            q41_section = f"""
+
+Q41 GENERAL GUIDELINES (ALWAYS ENFORCE):
+"{q41_guardrail}"
+"""
+
         validation_prompt = f"""
 You are a helpful guide helping a care worker complete their shift notes. Be supportive, clear, and specific. Help them improve their answer, don't criticize it.
 
@@ -1329,8 +1431,7 @@ QUESTION: {question_guardrail.split('.')[0] if '.' in question_guardrail else qu
 QUESTION REQUIREMENTS:
 "{question_guardrail}"
 
-LENGTH REQUIREMENT:
-"{q41_guardrail}"
+{length_requirement_section}{q41_section}{master_guardrail_section}
 
 🎯 APPROVAL PRIORITY: If the answer meets basic requirements, APPROVE IT immediately. Don't look for ways to reject it!
 
@@ -1352,7 +1453,7 @@ Return this exact JSON structure:
 VALIDATION RULES:
 1. "approve" - Answer meets basic requirements (minimum word count, answers the question, objective tone)
    ✅ ALWAYS APPROVE if answer has ALL of these:
-      - Minimum word count met ({q41_guardrail})
+     - Minimum word count met ({length_requirement_display})
       - Addresses the question topic clearly
       - Uses objective, professional language (not personal opinions like "I think", "I enjoyed")
       - Contains relevant information about the client/event/situation
@@ -1515,7 +1616,7 @@ Write as specific, direct action items. Be SHORT and CLEAR - tell them exactly w
 - "Add social interaction details"
 - "Include what time the event happened"
 - "Add details about how the client participated"
-- If too short: "Add more detail - you need {q41_guardrail}"
+- If too short: "Add more detail - you need {length_requirement_display}"
 - If grammar: "Fix spelling errors"
 - If personal opinions: "Remove personal thoughts (like 'I enjoyed') - use facts only"
 - NOT generic: "Objective description missing" or "Insufficient detail"
@@ -1523,7 +1624,7 @@ Write as specific, direct action items. Be SHORT and CLEAR - tell them exactly w
 ANALYSIS FORMAT (MANDATORY):
 Write DIRECTLY to the user in second person. Be SHORT, HELPFUL, and SPECIFIC (1 sentence max):
 ✅ GOOD examples:
-- "Add more detail about what the client did today. You need {q41_guardrail}."
+- "Add more detail about what the client did today. You need {length_requirement_display}."
 - "Describe the event with facts instead of personal thoughts (like 'I had pleasure')."
 - "Include what time the event happened and what activities took place."
 
@@ -1544,7 +1645,7 @@ SUGGESTED_ANSWER (CRITICAL RULES - AI COLLABORATION):
 - Start with EXACTLY what the user wrote (word-for-word if it makes sense)
 - ONLY expand and refine the user's actual words
 - Fix grammar, add structure, use professional language
-- Meet the minimum word count requirement ({q41_guardrail})
+- Meet the minimum word count requirement ({length_requirement_display})
 - Preserve ALL facts, events, and details the user mentioned
 - Complete sentences completely - NEVER leave blanks like "engaged in ." or "symptoms such as ."
 - Use generic descriptive language to complete thoughts (e.g., "engaged in activities" not "engaged in .")
@@ -1578,7 +1679,7 @@ CRITICAL - BE REASONABLE WITH VALIDATION (VERY IMPORTANT):
 ⚠️ When in doubt, APPROVE - it's better to accept a reasonable answer than reject unnecessarily
 
 APPROVAL DECISION TREE (FOLLOW STRICTLY):
-Step 1: Does answer meet minimum word count ({q41_guardrail})?
+Step 1: Does answer meet minimum word count ({length_requirement_display})?
   - YES → Go to Step 2
   - NO (significantly below, less than 75%) → REJECT for word count only
   
@@ -1752,19 +1853,29 @@ Step 4: Does answer contain relevant information about client/event/situation?
                     question_guardrail=question_guardrail,
                     q41_guardrail=q41_guardrail,
                     missing_elements=validation_data.get("missing_elements", []),
-                    analysis=validation_data.get("analysis", "")
+                    analysis=validation_data.get("analysis", ""),
+                    question_word_count=question_word_count,
+                    default_word_count_guardrail=default_word_count_guardrail,
+                    master_guardrail=master_guardrail
                 )
             
             # Ensure required fields exist
             final_safety_concerns = validation_data.get("safety_concerns", [])
+            guidelines_checked = ["Question-specific requirements (AI analyzed)"]
+            if question_word_count:
+                guidelines_checked.append("Question-specific word count requirements (AI analyzed)")
+            elif default_word_count_guardrail:
+                guidelines_checked.append("Default word count requirements (AI analyzed)")
+            if q41_guardrail:
+                guidelines_checked.append("Q41 general requirements (AI analyzed)")
+            if master_guardrail:
+                guidelines_checked.append("Master guardrail requirements (AI analyzed)")
+
             result = {
                 "word_count": word_count,
                 "missing_elements": validation_data.get("missing_elements", []),
                 "safety_concerns": final_safety_concerns,
-                "guidelines_checked": [
-                    "Question-specific requirements (AI analyzed)",
-                    "Q41 general requirements (AI analyzed)"
-                ],
+                "guidelines_checked": guidelines_checked,
                 "ai_analysis": validation_data.get("analysis", ""),
                 "word_count_analysis": validation_data.get("word_count_analysis", ""),
                 "content_quality": validation_data.get("content_quality", ""),
@@ -2829,6 +2940,26 @@ async def validate_answer(request: AnswerValidationRequest):
         logger.info(f"📝 Answer: {request.user_answer[:100]}...")
         logger.info(f"📋 Question Guardrail: {request.question_guardrail}")
         logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail}")
+        if request.master_guardrail:
+            logger.info(f"📋 Master Guardrail: {request.master_guardrail}")
+        else:
+            logger.info("📋 Master Guardrail: <not provided>")
+        if request.question_word_count:
+            logger.info(f"📋 Question Word Count: {request.question_word_count}")
+        else:
+            logger.info("📋 Question Word Count: <not provided>")
+        if request.default_word_count_guardrail:
+            logger.info(f"📋 Default Word Count Guardrail (fallback): {request.default_word_count_guardrail}")
+        else:
+            logger.info("📋 Default Word Count Guardrail (fallback): <not provided>")
+        logger.info("=" * 80)
+        logger.info("🛡️ MASTER GUARDRAIL SNAPSHOT (BACKEND)")
+        if request.master_guardrail:
+            logger.info(f"🛡️ Master guardrail content: {request.master_guardrail}")
+            logger.info(f"🛡️ Master guardrail length: {len(request.master_guardrail)} characters")
+        else:
+            logger.info("🛡️ Master guardrail not provided with request")
+        logger.info("=" * 80)
         
         # Check if AI suggestion was provided and validate modifications
         modification_status = {}
@@ -2842,6 +2973,9 @@ async def validate_answer(request: AnswerValidationRequest):
         logger.info(f"   - user_answer: '{request.user_answer}'")
         logger.info(f"   - question_guardrail: '{request.question_guardrail}'")
         logger.info(f"   - q41_guardrail: '{request.q41_guardrail}'")
+        logger.info(f"   - master_guardrail: '{request.master_guardrail}'")
+        logger.info(f"   - question_word_count: '{request.question_word_count}'")
+        logger.info(f"   - default_word_count_guardrail: '{request.default_word_count_guardrail}'")
         if request.ai_suggestion:
             logger.info(f"   - ai_suggestion: '{request.ai_suggestion[:100]}...'")
         
@@ -2855,6 +2989,9 @@ async def validate_answer(request: AnswerValidationRequest):
             request.user_answer,
             request.question_guardrail,
             request.q41_guardrail,
+            request.question_word_count,
+            request.default_word_count_guardrail,
+            request.master_guardrail,
             request_id=request_id
         )
         
