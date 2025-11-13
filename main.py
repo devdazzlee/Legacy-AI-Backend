@@ -1229,7 +1229,93 @@ async def generate_suggested_answer(
     """
     Generate a suggested corrected answer when the AI doesn't provide one.
     """
-    logger.info("🎯 Generating suggested answer as fallback...")
+    logger.info("=" * 80)
+    logger.info("🎯 GENERATING SUGGESTED ANSWER FALLBACK")
+    logger.info("=" * 80)
+    
+    # ========== INDIVIDUAL GUARDRAIL LOGGING (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🛡️ INDIVIDUAL GUARDRAIL (SUGGESTION GENERATION)")
+    logger.info("=" * 80)
+    if question_guardrail and question_guardrail.strip():
+        logger.info(f"✅ INDIVIDUAL GUARDRAIL: AVAILABLE")
+        logger.info(f"📋 Content: '{question_guardrail[:200]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(question_guardrail)} characters")
+        logger.info(f"📊 Word count: {len(question_guardrail.split())} words")
+    else:
+        logger.info("❌ INDIVIDUAL GUARDRAIL: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== MASTER GUARDRAIL LOGGING (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🛡️ MASTER GUARDRAIL (SUGGESTION GENERATION)")
+    logger.info("=" * 80)
+    if master_guardrail and master_guardrail.strip():
+        logger.info(f"✅ MASTER GUARDRAIL: AVAILABLE")
+        logger.info(f"📋 Content: '{master_guardrail[:200]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(master_guardrail)} characters")
+        logger.info(f"📊 Word count: {len(master_guardrail.split())} words")
+    else:
+        logger.info("❌ MASTER GUARDRAIL: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== INDIVIDUAL WORD COUNT LOGGING (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🧮 INDIVIDUAL WORD COUNT (SUGGESTION GENERATION)")
+    logger.info("=" * 80)
+    if question_word_count and question_word_count.strip():
+        logger.info(f"✅ INDIVIDUAL WORD COUNT: AVAILABLE")
+        logger.info(f"📋 Content: '{question_word_count}'")
+        logger.info(f"📏 Length: {len(question_word_count)} characters")
+    else:
+        logger.info("❌ INDIVIDUAL WORD COUNT: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== DEFAULT WORD COUNT LOGGING (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🧮 DEFAULT WORD COUNT (SUGGESTION GENERATION)")
+    logger.info("=" * 80)
+    if default_word_count_guardrail and default_word_count_guardrail.strip():
+        logger.info(f"✅ DEFAULT WORD COUNT: AVAILABLE")
+        logger.info(f"📋 Content: '{default_word_count_guardrail}'")
+        logger.info(f"📏 Length: {len(default_word_count_guardrail)} characters")
+    else:
+        logger.info("❌ DEFAULT WORD COUNT: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== GUARDRAIL SELECTION LOGIC (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🎯 GUARDRAIL SELECTION FOR SUGGESTION")
+    logger.info("=" * 80)
+    
+    # Determine which guardrail to use: individual takes priority, fallback to master
+    effective_guardrail = question_guardrail if question_guardrail and question_guardrail.strip() else master_guardrail
+    guardrail_source = "question-specific" if (question_guardrail and question_guardrail.strip()) else "master (fallback)" if master_guardrail else "not provided"
+    
+    if question_guardrail and question_guardrail.strip():
+        logger.info(f"✅ SELECTED: INDIVIDUAL GUARDRAIL (question-specific)")
+        logger.info(f"📋 Using: '{question_guardrail[:100]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(question_guardrail)} characters")
+        logger.info(f"🚫 IGNORING: Master guardrail (individual available)")
+    elif master_guardrail and master_guardrail.strip():
+        logger.info(f"✅ SELECTED: MASTER GUARDRAIL (fallback - individual not available)")
+        logger.info(f"📋 Using: '{master_guardrail[:100]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(master_guardrail)} characters")
+        logger.info(f"⚠️ REASON: Individual guardrail not provided or empty")
+    else:
+        logger.warning("❌ NO GUARDRAIL AVAILABLE (neither individual nor master)")
+    logger.info("=" * 80)
+    
+    # ========== WORD COUNT SELECTION LOGIC (SUGGESTION) ==========
+    logger.info("=" * 80)
+    logger.info("🎯 WORD COUNT SELECTION FOR SUGGESTION")
+    logger.info("=" * 80)
+    
+    # Word count logic: individual takes priority, fallback to default
     length_requirement_text = question_word_count or default_word_count_guardrail
     length_requirement_source = (
         "question-specific" if question_word_count else
@@ -1238,17 +1324,37 @@ async def generate_suggested_answer(
     )
     length_requirement_display = length_requirement_text or "No specific requirement provided"
     length_requirement_prompt_value = length_requirement_text or "Not provided"
-    if length_requirement_text:
-        logger.info(f"🧮 Length requirement for suggestion ({length_requirement_source}): {length_requirement_text}")
+    
+    if question_word_count and question_word_count.strip():
+        logger.info(f"✅ SELECTED: INDIVIDUAL WORD COUNT (question-specific)")
+        logger.info(f"📋 Using: '{question_word_count}'")
+        logger.info(f"🚫 IGNORING: Default word count (individual available)")
+    elif default_word_count_guardrail and default_word_count_guardrail.strip():
+        logger.info(f"✅ SELECTED: DEFAULT WORD COUNT (fallback - individual not available)")
+        logger.info(f"📋 Using: '{default_word_count_guardrail}'")
+        logger.info(f"⚠️ REASON: Individual word count not provided or empty")
     else:
-        logger.info("🧮 Length requirement for suggestion: <not provided>")
-    if master_guardrail:
-        logger.info(f"🛡️ Master guardrail (suggested answer context): {master_guardrail}")
-        logger.info(f"🛡️ Master guardrail length: {len(master_guardrail)} characters")
-    else:
-        logger.info("🛡️ Master guardrail (suggested answer context): <missing>")
+        logger.warning("❌ NO WORD COUNT AVAILABLE (neither individual nor default)")
+    
+    logger.info(f"📊 EFFECTIVE LENGTH REQUIREMENT: '{length_requirement_display}'")
+    logger.info(f"📌 SOURCE: {length_requirement_source}")
+    logger.info("=" * 80)
     
     try:
+        # Build guardrail section based on which one we're using
+        guardrail_section = ""
+        if effective_guardrail:
+            if question_guardrail and question_guardrail.strip():
+                guardrail_section = f"""
+QUESTION REQUIREMENTS (INDIVIDUAL - QUESTION-SPECIFIC):
+"{question_guardrail}"
+"""
+            elif master_guardrail:
+                guardrail_section = f"""
+QUESTION REQUIREMENTS (MASTER - FALLBACK, INDIVIDUAL NOT AVAILABLE):
+"{master_guardrail}"
+"""
+        
         prompt = f"""Generate a complete, corrected version of this answer that meets ALL requirements.
 
 ⚠️ CRITICAL RULE: The suggestion must be DERIVATIVE of what the caregiver actually entered, but COMPLETE and ready to use.
@@ -1261,13 +1367,10 @@ async def generate_suggested_answer(
 - Preserve ALL facts and details from the user's answer
 - The answer MUST be complete and grammatically correct - no placeholders, no blanks
 
-GLOBAL MASTER GUARDRAIL (MUST ALWAYS BE FOLLOWED):
-"{master_guardrail if master_guardrail else 'No additional master guardrail provided.'}"
-
-Ensure the final answer follows the question-specific requirements, Q41 guidelines, and the global master guardrail exactly.
+{guardrail_section}
+Ensure the final answer follows the question requirements above and Q41 guidelines exactly.
 
 Original Answer: "{user_answer}"
-Question Requirements: "{question_guardrail}"
 Q41 Guidelines: "{q41_guardrail}"
 Length Requirement ({length_requirement_source.upper()}): "{length_requirement_prompt_value}"
 Missing Elements: {missing_elements}
@@ -1343,27 +1446,60 @@ async def validate_answer_with_ai(
     logger.info("=" * 60)
     
     logger.info(f"📝 USER ANSWER: '{user_answer}'")
-    logger.info(f"📋 QUESTION GUARDRAIL: '{question_guardrail}'")
     logger.info(f"📋 Q41 GUARDRAIL: '{q41_guardrail}'")
-    if question_word_count:
-        logger.info(f"📋 QUESTION WORD COUNT: '{question_word_count}'")
-    else:
-        logger.info("📋 QUESTION WORD COUNT: <not provided>")
-    if default_word_count_guardrail:
-        logger.info(f"📋 DEFAULT WORD COUNT GUARDRAIL: '{default_word_count_guardrail}'")
-    else:
-        logger.info("📋 DEFAULT WORD COUNT GUARDRAIL: <not provided>")
-    if master_guardrail:
-        logger.info(f"📋 MASTER GUARDRAIL: '{master_guardrail}'")
-    else:
-        logger.info("📋 MASTER GUARDRAIL: <not provided>")
+    
+    # ========== INDIVIDUAL GUARDRAIL LOGGING ==========
     logger.info("=" * 80)
-    logger.info("🛡️ MASTER GUARDRAIL (AI PIPELINE INPUT)")
-    if master_guardrail:
-        logger.info(f"🛡️ Content: {master_guardrail}")
-        logger.info(f"🛡️ Length: {len(master_guardrail)} characters")
+    logger.info("🛡️ INDIVIDUAL GUARDRAIL (QUESTION-SPECIFIC)")
+    logger.info("=" * 80)
+    if question_guardrail and question_guardrail.strip():
+        logger.info(f"✅ INDIVIDUAL GUARDRAIL: AVAILABLE")
+        logger.info(f"📋 Content: '{question_guardrail}'")
+        logger.info(f"📏 Length: {len(question_guardrail)} characters")
+        logger.info(f"📊 Word count: {len(question_guardrail.split())} words")
     else:
-        logger.info("🛡️ Content: <not provided>")
+        logger.info("❌ INDIVIDUAL GUARDRAIL: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== MASTER GUARDRAIL LOGGING ==========
+    logger.info("=" * 80)
+    logger.info("🛡️ MASTER GUARDRAIL (GLOBAL FALLBACK)")
+    logger.info("=" * 80)
+    if master_guardrail and master_guardrail.strip():
+        logger.info(f"✅ MASTER GUARDRAIL: AVAILABLE")
+        logger.info(f"📋 Content: '{master_guardrail}'")
+        logger.info(f"📏 Length: {len(master_guardrail)} characters")
+        logger.info(f"📊 Word count: {len(master_guardrail.split())} words")
+    else:
+        logger.info("❌ MASTER GUARDRAIL: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== INDIVIDUAL WORD COUNT LOGGING ==========
+    logger.info("=" * 80)
+    logger.info("🧮 INDIVIDUAL WORD COUNT (QUESTION-SPECIFIC)")
+    logger.info("=" * 80)
+    if question_word_count and question_word_count.strip():
+        logger.info(f"✅ INDIVIDUAL WORD COUNT: AVAILABLE")
+        logger.info(f"📋 Content: '{question_word_count}'")
+        logger.info(f"📏 Length: {len(question_word_count)} characters")
+    else:
+        logger.info("❌ INDIVIDUAL WORD COUNT: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
+    logger.info("=" * 80)
+    
+    # ========== DEFAULT WORD COUNT LOGGING ==========
+    logger.info("=" * 80)
+    logger.info("🧮 DEFAULT WORD COUNT (MASTER FALLBACK)")
+    logger.info("=" * 80)
+    if default_word_count_guardrail and default_word_count_guardrail.strip():
+        logger.info(f"✅ DEFAULT WORD COUNT: AVAILABLE")
+        logger.info(f"📋 Content: '{default_word_count_guardrail}'")
+        logger.info(f"📏 Length: {len(default_word_count_guardrail)} characters")
+    else:
+        logger.info("❌ DEFAULT WORD COUNT: NOT AVAILABLE (empty or missing)")
+        logger.info("📋 Content: <not provided or empty>")
     logger.info("=" * 80)
     
     # Basic word count for logging
@@ -1371,14 +1507,39 @@ async def validate_answer_with_ai(
     logger.info(f"📊 WORD COUNT: {word_count}")
     
     # Validate inputs
-    if not question_guardrail:
-        logger.error("❌ QUESTION GUARDRAIL MISSING")
-        raise ValueError("Question guardrail must be provided from frontend")
-    
     if not q41_guardrail:
         logger.error("❌ Q41 GUARDRAIL MISSING")
         raise ValueError("Q41 guardrail must be provided from frontend")
 
+    # ========== GUARDRAIL SELECTION LOGIC ==========
+    logger.info("=" * 80)
+    logger.info("🎯 GUARDRAIL SELECTION DECISION")
+    logger.info("=" * 80)
+    
+    # Determine which guardrail to use: individual takes priority, fallback to master
+    effective_guardrail = question_guardrail if question_guardrail and question_guardrail.strip() else master_guardrail
+    guardrail_source = "question-specific" if (question_guardrail and question_guardrail.strip()) else "master (fallback)" if master_guardrail else "not provided"
+    
+    if question_guardrail and question_guardrail.strip():
+        logger.info(f"✅ SELECTED: INDIVIDUAL GUARDRAIL (question-specific)")
+        logger.info(f"📋 Using: '{question_guardrail[:100]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(question_guardrail)} characters")
+        logger.info(f"🚫 IGNORING: Master guardrail (individual available)")
+    elif master_guardrail and master_guardrail.strip():
+        logger.info(f"✅ SELECTED: MASTER GUARDRAIL (fallback - individual not available)")
+        logger.info(f"📋 Using: '{master_guardrail[:100]}...' (truncated)")
+        logger.info(f"📏 Full length: {len(master_guardrail)} characters")
+        logger.info(f"⚠️ REASON: Individual guardrail not provided or empty")
+    else:
+        logger.warning("❌ NO GUARDRAIL AVAILABLE (neither individual nor master)")
+    logger.info("=" * 80)
+    
+    # ========== WORD COUNT SELECTION LOGIC ==========
+    logger.info("=" * 80)
+    logger.info("🎯 WORD COUNT SELECTION DECISION")
+    logger.info("=" * 80)
+    
+    # Word count logic: individual takes priority, fallback to default
     length_requirement_text = question_word_count or default_word_count_guardrail
     length_requirement_source = (
         "question-specific" if question_word_count else
@@ -1387,18 +1548,30 @@ async def validate_answer_with_ai(
     )
     length_requirement_display = length_requirement_text or "No specific requirement provided"
     length_requirement_prompt_value = length_requirement_text or "Not provided"
-    if length_requirement_text:
-        logger.info(f"🧮 EFFECTIVE LENGTH REQUIREMENT ({length_requirement_source}): '{length_requirement_text}'")
+    
+    if question_word_count and question_word_count.strip():
+        logger.info(f"✅ SELECTED: INDIVIDUAL WORD COUNT (question-specific)")
+        logger.info(f"📋 Using: '{question_word_count}'")
+        logger.info(f"🚫 IGNORING: Default word count (individual available)")
+    elif default_word_count_guardrail and default_word_count_guardrail.strip():
+        logger.info(f"✅ SELECTED: DEFAULT WORD COUNT (fallback - individual not available)")
+        logger.info(f"📋 Using: '{default_word_count_guardrail}'")
+        logger.info(f"⚠️ REASON: Individual word count not provided or empty")
     else:
-        logger.info("🧮 EFFECTIVE LENGTH REQUIREMENT: <not provided>")
+        logger.warning("❌ NO WORD COUNT AVAILABLE (neither individual nor default)")
+    
+    logger.info(f"📊 EFFECTIVE LENGTH REQUIREMENT: '{length_requirement_display}'")
+    logger.info(f"📌 SOURCE: {length_requirement_source}")
+    logger.info("=" * 80)
 
     try:
         # Create AI prompt for validation
+        # Only include master guardrail section if we're using master (individual not available)
         master_guardrail_section = ""
-        if master_guardrail:
+        if not (question_guardrail and question_guardrail.strip()) and master_guardrail:
             master_guardrail_section = f"""
 
-MASTER REQUIREMENTS (APPLY TO EVERY ANSWER, EVEN IF NOT RESTATED ABOVE):
+MASTER REQUIREMENTS (USED AS FALLBACK - INDIVIDUAL GUARDRAIL NOT AVAILABLE):
 "{master_guardrail}"
 """
 
@@ -1418,6 +1591,18 @@ Q41 GENERAL GUIDELINES (ALWAYS ENFORCE):
 "{q41_guardrail}"
 """
 
+        # Build question requirements section based on which guardrail we're using
+        question_requirements_section = ""
+        if effective_guardrail:
+            question_label = effective_guardrail.split('.')[0] if '.' in effective_guardrail else effective_guardrail
+            question_requirements_section = f"""
+
+QUESTION: {question_label}
+
+QUESTION REQUIREMENTS ({guardrail_source.upper()}):
+"{effective_guardrail}"
+"""
+
         validation_prompt = f"""
 You are a helpful guide helping a care worker complete their shift notes. Be supportive, clear, and specific. Help them improve their answer, don't criticize it.
 
@@ -1425,13 +1610,7 @@ You are a helpful guide helping a care worker complete their shift notes. Be sup
 
 USER'S ANSWER:
 "{user_answer}"
-
-QUESTION: {question_guardrail.split('.')[0] if '.' in question_guardrail else question_guardrail}
-
-QUESTION REQUIREMENTS:
-"{question_guardrail}"
-
-{length_requirement_section}{q41_section}{master_guardrail_section}
+{question_requirements_section}{length_requirement_section}{q41_section}{master_guardrail_section}
 
 🎯 APPROVAL PRIORITY: If the answer meets basic requirements, APPROVE IT immediately. Don't look for ways to reject it!
 
@@ -1861,15 +2040,21 @@ Step 4: Does answer contain relevant information about client/event/situation?
             
             # Ensure required fields exist
             final_safety_concerns = validation_data.get("safety_concerns", [])
-            guidelines_checked = ["Question-specific requirements (AI analyzed)"]
+            
+            # Build guidelines_checked based on what was actually used
+            guidelines_checked = []
+            if question_guardrail and question_guardrail.strip():
+                guidelines_checked.append("Question-specific guardrail requirements (AI analyzed)")
+            elif master_guardrail:
+                guidelines_checked.append("Master guardrail requirements (AI analyzed - fallback)")
+            
             if question_word_count:
                 guidelines_checked.append("Question-specific word count requirements (AI analyzed)")
             elif default_word_count_guardrail:
-                guidelines_checked.append("Default word count requirements (AI analyzed)")
+                guidelines_checked.append("Default word count requirements (AI analyzed - fallback)")
+            
             if q41_guardrail:
                 guidelines_checked.append("Q41 general requirements (AI analyzed)")
-            if master_guardrail:
-                guidelines_checked.append("Master guardrail requirements (AI analyzed)")
 
             result = {
                 "word_count": word_count,
@@ -2935,30 +3120,65 @@ async def validate_answer(request: AnswerValidationRequest):
         # This prevents duplicate validation requests from causing issues
         request_tracker.cleanup_old_requests()
         
-        logger.info(f"🔍 Validating answer")
+        logger.info("=" * 80)
+        logger.info("🔍 VALIDATION REQUEST RECEIVED")
+        logger.info("=" * 80)
         logger.info(f"📋 Request ID: {request_id} (timestamp: {request_timestamp})")
         logger.info(f"📝 Answer: {request.user_answer[:100]}...")
-        logger.info(f"📋 Question Guardrail: {request.question_guardrail}")
-        logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail}")
-        if request.master_guardrail:
-            logger.info(f"📋 Master Guardrail: {request.master_guardrail}")
-        else:
-            logger.info("📋 Master Guardrail: <not provided>")
-        if request.question_word_count:
-            logger.info(f"📋 Question Word Count: {request.question_word_count}")
-        else:
-            logger.info("📋 Question Word Count: <not provided>")
-        if request.default_word_count_guardrail:
-            logger.info(f"📋 Default Word Count Guardrail (fallback): {request.default_word_count_guardrail}")
-        else:
-            logger.info("📋 Default Word Count Guardrail (fallback): <not provided>")
+        logger.info(f"📋 Q41 Guardrail: {request.q41_guardrail[:100] if request.q41_guardrail else '<not provided>'}...")
+        
+        # ========== INDIVIDUAL GUARDRAIL LOGGING (API ENDPOINT) ==========
         logger.info("=" * 80)
-        logger.info("🛡️ MASTER GUARDRAIL SNAPSHOT (BACKEND)")
-        if request.master_guardrail:
-            logger.info(f"🛡️ Master guardrail content: {request.master_guardrail}")
-            logger.info(f"🛡️ Master guardrail length: {len(request.master_guardrail)} characters")
+        logger.info("🛡️ INDIVIDUAL GUARDRAIL (API REQUEST)")
+        logger.info("=" * 80)
+        if request.question_guardrail and request.question_guardrail.strip():
+            logger.info(f"✅ INDIVIDUAL GUARDRAIL: AVAILABLE")
+            logger.info(f"📋 Content: '{request.question_guardrail[:200]}...' (truncated)")
+            logger.info(f"📏 Full length: {len(request.question_guardrail)} characters")
+            logger.info(f"📊 Word count: {len(request.question_guardrail.split())} words")
         else:
-            logger.info("🛡️ Master guardrail not provided with request")
+            logger.info("❌ INDIVIDUAL GUARDRAIL: NOT AVAILABLE (empty or missing)")
+            logger.info("📋 Content: <not provided or empty>")
+        logger.info("=" * 80)
+        
+        # ========== MASTER GUARDRAIL LOGGING (API ENDPOINT) ==========
+        logger.info("=" * 80)
+        logger.info("🛡️ MASTER GUARDRAIL (API REQUEST)")
+        logger.info("=" * 80)
+        if request.master_guardrail and request.master_guardrail.strip():
+            logger.info(f"✅ MASTER GUARDRAIL: AVAILABLE")
+            logger.info(f"📋 Content: '{request.master_guardrail[:200]}...' (truncated)")
+            logger.info(f"📏 Full length: {len(request.master_guardrail)} characters")
+            logger.info(f"📊 Word count: {len(request.master_guardrail.split())} words")
+        else:
+            logger.info("❌ MASTER GUARDRAIL: NOT AVAILABLE (empty or missing)")
+            logger.info("📋 Content: <not provided or empty>")
+        logger.info("=" * 80)
+        
+        # ========== INDIVIDUAL WORD COUNT LOGGING (API ENDPOINT) ==========
+        logger.info("=" * 80)
+        logger.info("🧮 INDIVIDUAL WORD COUNT (API REQUEST)")
+        logger.info("=" * 80)
+        if request.question_word_count and request.question_word_count.strip():
+            logger.info(f"✅ INDIVIDUAL WORD COUNT: AVAILABLE")
+            logger.info(f"📋 Content: '{request.question_word_count}'")
+            logger.info(f"📏 Length: {len(request.question_word_count)} characters")
+        else:
+            logger.info("❌ INDIVIDUAL WORD COUNT: NOT AVAILABLE (empty or missing)")
+            logger.info("📋 Content: <not provided or empty>")
+        logger.info("=" * 80)
+        
+        # ========== DEFAULT WORD COUNT LOGGING (API ENDPOINT) ==========
+        logger.info("=" * 80)
+        logger.info("🧮 DEFAULT WORD COUNT (API REQUEST)")
+        logger.info("=" * 80)
+        if request.default_word_count_guardrail and request.default_word_count_guardrail.strip():
+            logger.info(f"✅ DEFAULT WORD COUNT: AVAILABLE")
+            logger.info(f"📋 Content: '{request.default_word_count_guardrail}'")
+            logger.info(f"📏 Length: {len(request.default_word_count_guardrail)} characters")
+        else:
+            logger.info("❌ DEFAULT WORD COUNT: NOT AVAILABLE (empty or missing)")
+            logger.info("📋 Content: <not provided or empty>")
         logger.info("=" * 80)
         
         # Check if AI suggestion was provided and validate modifications
