@@ -2727,6 +2727,181 @@ async def speech_to_text(request: dict):
         logger.error(f"❌ SPEECH-TO-TEXT ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error in speech-to-text: {str(e)}")
 
+# Location Exception Validation
+class LocationExceptionRequest(BaseModel):
+    explanation: str
+    client_id: str
+    dsw_id: str
+    current_latitude: float
+    current_longitude: float
+    approved_latitude: float
+    approved_longitude: float
+    distance_meters: float
+
+class LocationExceptionResponse(BaseModel):
+    is_acceptable: bool
+    status: str  # "accept" or "reject"
+    feedback: str
+    missing_elements: List[str] = []
+
+@app.post("/validate-location-explanation", response_model=LocationExceptionResponse)
+async def validate_location_explanation(request: LocationExceptionRequest):
+    """
+    Validate location exception explanation using AI
+    
+    Accepts if explanation includes:
+    - Specific location name
+    - Legitimate reason
+    - Authorization details
+    
+    Rejects if explanation is:
+    - Vague or missing key details
+    - Incoherent
+    """
+    try:
+        logger.info(f"📍 LOCATION EXCEPTION VALIDATION - Client: {request.client_id}, DSW: {request.dsw_id}")
+        logger.info(f"📍 Distance: {request.distance_meters:.2f} meters")
+        logger.info(f"📍 Explanation: '{request.explanation[:100]}...'")
+        
+        if not azure_service._initialized:
+            azure_service._initialize_client()
+        
+        # AI prompt for location explanation validation
+        validation_prompt = f"""You are validating a location exception explanation from a healthcare worker.
+
+WORKER'S EXPLANATION: "{request.explanation}"
+
+CONTEXT:
+- Worker is {request.distance_meters:.0f} meters away from approved client location
+- Worker is trying to start their shift
+
+VALIDATION RULES:
+
+✅ ACCEPT if explanation includes ALL of:
+1. Specific location name (e.g., "Dr. Smith's office", "Riverside Park", "client's doctor appointment")
+2. Legitimate reason (medical appointment, community activity, client request, family emergency)
+3. Authorization details (supervisor name, family member, client authorization)
+
+❌ REJECT if explanation is:
+- Vague ("I'm nearby", "running errands", "I don't know", "just here")
+- Missing key details (no location name, no reason, no authorization)
+- Incoherent or unclear
+- Generic excuses without specifics
+
+RESPONSE FORMAT (JSON):
+{{
+    "is_acceptable": true/false,
+    "status": "accept" or "reject",
+    "feedback": "Brief explanation of decision",
+    "missing_elements": ["list", "of", "missing", "elements"] (only if rejected)
+}}
+
+Return ONLY valid JSON, no other text."""
+
+        response = azure_service.client.chat.completions.create(
+            model=azure_service.deployment,
+            messages=[
+                {"role": "system", "content": "You are a location validation expert. Return only valid JSON."},
+                {"role": "user", "content": validation_prompt}
+            ],
+            max_tokens=300,
+            temperature=0.3
+        )
+        
+        result_text = response.choices[0].message.content.strip()
+        logger.info(f"📍 AI Response: {result_text}")
+        
+        # Parse JSON response
+        import json
+        try:
+            # Remove markdown code blocks if present
+            if result_text.startswith("```"):
+                result_text = result_text.split("```")[1]
+                if result_text.startswith("json"):
+                    result_text = result_text[4:]
+            result_text = result_text.strip()
+            
+            ai_result = json.loads(result_text)
+            
+            is_acceptable = ai_result.get("is_acceptable", False)
+            status = ai_result.get("status", "reject")
+            feedback = ai_result.get("feedback", "Explanation needs more detail.")
+            missing_elements = ai_result.get("missing_elements", [])
+            
+            logger.info(f"📍 Validation Result: {status} - {feedback}")
+            
+            return LocationExceptionResponse(
+                is_acceptable=is_acceptable,
+                status=status,
+                feedback=feedback,
+                missing_elements=missing_elements
+            )
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Failed to parse AI response as JSON: {e}")
+            logger.error(f"❌ Raw response: {result_text}")
+            # Fallback: Use simple keyword-based validation
+            explanation_lower = request.explanation.lower()
+            has_location = any(word in explanation_lower for word in ["location", "office", "appointment", "park", "home", "hospital", "clinic", "doctor"])
+            has_reason = any(word in explanation_lower for word in ["appointment", "emergency", "request", "authorized", "supervisor", "family"])
+            has_authorization = any(word in explanation_lower for word in ["authorized", "supervisor", "approved", "permission", "allowed", "family"])
+            
+            is_acceptable = has_location and has_reason and has_authorization
+            
+            return LocationExceptionResponse(
+                is_acceptable=is_acceptable,
+                status="accept" if is_acceptable else "reject",
+                feedback="Explanation accepted" if is_acceptable else "Please include specific location name, reason, and who authorized it.",
+                missing_elements=[] if is_acceptable else ["Specific location name", "Reason for being there", "Authorization details"]
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ LOCATION EXCEPTION VALIDATION ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error validating location explanation: {str(e)}")
+
+class LogLocationExceptionRequest(BaseModel):
+    dsw_id: str
+    client_id: str
+    explanation: str
+    transcription: str
+    current_latitude: float
+    current_longitude: float
+    approved_latitude: float
+    approved_longitude: float
+    distance_meters: float
+    ai_decision: str  # "accept" or "reject"
+    ai_feedback: str
+
+class LogLocationExceptionResponse(BaseModel):
+    success: bool
+    exception_id: str
+    message: str
+
+@app.post("/log-location-exception", response_model=LogLocationExceptionResponse)
+async def log_location_exception(request: LogLocationExceptionRequest):
+    """
+    Log location exception for supervisor review
+    In production, this would save to database
+    """
+    try:
+        logger.info(f"📝 LOGGING LOCATION EXCEPTION - DSW: {request.dsw_id}, Client: {request.client_id}")
+        logger.info(f"📝 AI Decision: {request.ai_decision}")
+        logger.info(f"📝 Distance: {request.distance_meters:.2f} meters")
+        
+        # In production, save to database here
+        # For now, just log it
+        exception_id = f"LOC-{request.dsw_id}-{request.client_id}-{int(time.time())}"
+        
+        logger.info(f"✅ Location exception logged: {exception_id}")
+        
+        return LogLocationExceptionResponse(
+            success=True,
+            exception_id=exception_id,
+            message="Location exception logged successfully"
+        )
+    except Exception as e:
+        logger.error(f"❌ ERROR LOGGING LOCATION EXCEPTION: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error logging location exception: {str(e)}")
+
 # AI Prescreener endpoints
 class ConflictDetectionRequest(BaseModel):
     concepts: List[str]
