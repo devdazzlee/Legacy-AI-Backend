@@ -143,6 +143,21 @@ class PrescreenerResponse(BaseModel):
     requiredActions: List[str]  # What user must do next
     canSubmit: bool  # Whether user can submit the current message
 
+class GrammarCheckRequest(BaseModel):
+    text: str  # Text to check for grammar errors
+
+class GrammarError(BaseModel):
+    original: str  # Original incorrect text
+    corrected: str  # Corrected text
+    type: str  # Type of error (e.g., "spelling", "grammar", "punctuation", "capitalization")
+    explanation: str  # Brief explanation of the correction
+
+class GrammarCheckResponse(BaseModel):
+    corrected_text: str  # Fully corrected text
+    has_errors: bool  # Whether any errors were found
+    errors: List[GrammarError]  # List of specific errors found and corrected
+    original_text: str  # Original text (for reference)
+
 # Request tracking system for cancellation and late response detection
 class RequestTracker:
     """Track active requests for cancellation and late response detection"""
@@ -1103,6 +1118,165 @@ Return ONLY the example message (no labels, no extra text).
                 "requiredActions": ["Review your message", "Try analyzing again"],
                 "canSubmit": False
             }
+
+    def check_grammar(self, text: str) -> Dict[str, Any]:
+        """
+        Check and correct grammar in text using AI
+        
+        Args:
+            text: The text to check for grammar errors
+            
+        Returns:
+            Dictionary with corrected_text, has_errors, and errors list
+        """
+        try:
+            if not self._initialized:
+                self._initialize_client()
+            
+            if not text or not text.strip():
+                return {
+                    "corrected_text": text,
+                    "has_errors": False,
+                    "errors": [],
+                    "original_text": text
+                }
+            
+            # Create AI prompt for grammar checking
+            grammar_prompt = f"""You are an expert grammar and language checker. Your task is to check the following text for grammar, spelling, punctuation, and capitalization errors, then provide the corrected version.
+
+IMPORTANT RULES:
+1. Only correct actual errors - do not change the meaning or style
+2. Preserve the user's writing style and tone
+3. Keep all technical terms, names, and specific details unchanged
+4. Only fix: grammar mistakes, spelling errors, punctuation issues, capitalization errors
+5. Do NOT rewrite or improve the content - only fix errors
+6. Return ONLY the corrected text, nothing else
+
+Text to check:
+"{text}"
+
+Provide the corrected version of the text. Return ONLY the corrected text without any explanations, notes, or additional formatting."""
+
+            # Get grammar check from Azure OpenAI
+            grammar_response = self.client.chat.completions.create(
+                model=self.deployment,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert grammar and language checker. You correct grammar, spelling, punctuation, and capitalization errors while preserving the original meaning and style."
+                    },
+                    {
+                        "role": "user",
+                        "content": grammar_prompt
+                    }
+                ],
+                max_tokens=2000,
+                temperature=0.1,  # Low temperature for consistent corrections
+                top_p=0.95,
+                frequency_penalty=0,
+                presence_penalty=0,
+                stop=None,
+                stream=False
+            )
+
+            corrected_text = grammar_response.choices[0].message.content.strip()
+            
+            # Remove any quotes if AI wrapped the response
+            if corrected_text.startswith('"') and corrected_text.endswith('"'):
+                corrected_text = corrected_text[1:-1]
+            if corrected_text.startswith("'") and corrected_text.endswith("'"):
+                corrected_text = corrected_text[1:-1]
+            
+            # Compare original and corrected to identify errors
+            has_errors = corrected_text != text
+            errors = []
+            
+            if has_errors:
+                # Simple error detection - compare word by word and character by character
+                original_words = text.split()
+                corrected_words = corrected_text.split()
+                
+                # Find differences
+                i = 0
+                j = 0
+                while i < len(original_words) or j < len(corrected_words):
+                    if i < len(original_words) and j < len(corrected_words):
+                        if original_words[i] != corrected_words[j]:
+                            # Error found
+                            error_type = "grammar"
+                            if original_words[i].lower() != corrected_words[j].lower():
+                                error_type = "spelling"
+                            elif original_words[i].capitalize() == corrected_words[j] or original_words[i].upper() == corrected_words[j]:
+                                error_type = "capitalization"
+                            
+                            errors.append({
+                                "original": original_words[i],
+                                "corrected": corrected_words[j],
+                                "type": error_type,
+                                "explanation": f"Corrected {error_type} error"
+                            })
+                            i += 1
+                            j += 1
+                        else:
+                            i += 1
+                            j += 1
+                    elif i < len(original_words):
+                        # Extra word in original (removed)
+                        errors.append({
+                            "original": original_words[i],
+                            "corrected": "",
+                            "type": "grammar",
+                            "explanation": "Removed unnecessary word"
+                        })
+                        i += 1
+                    else:
+                        # Extra word in corrected (added)
+                        errors.append({
+                            "original": "",
+                            "corrected": corrected_words[j],
+                            "type": "grammar",
+                            "explanation": "Added missing word"
+                        })
+                        j += 1
+            
+            logger.info(f"✅ Grammar check completed. Errors found: {len(errors)}")
+            
+            return {
+                "corrected_text": corrected_text,
+                "has_errors": has_errors,
+                "errors": errors,
+                "original_text": text
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error checking grammar: {str(e)}")
+            # Return original text on error
+            return {
+                "corrected_text": text,
+                "has_errors": False,
+                "errors": [],
+                "original_text": text
+            }
+
+    def quick_grammar_check(self, text: str) -> str:
+        """
+        Quick grammar check - returns only corrected text (faster, lighter)
+        
+        Args:
+            text: The text to check for grammar errors
+            
+        Returns:
+            Corrected text string
+        """
+        try:
+            if not text or not text.strip() or len(text.strip()) < 3:
+                return text
+            
+            result = self.check_grammar(text)
+            return result.get("corrected_text", text)
+        except Exception as e:
+            logger.error(f"❌ Error in quick grammar check: {str(e)}")
+            return text
 
 # Initialize service
 azure_service = AzureOpenAIService()
@@ -3459,3 +3633,73 @@ async def validate_answer(request: AnswerValidationRequest):
             status_code=500, 
             detail=f"Error validating answer: {str(e)}"
         )
+
+@app.post("/grammar/check", response_model=GrammarCheckResponse)
+async def check_grammar(request: GrammarCheckRequest):
+    """
+    Check and correct grammar in text using AI
+    
+    This endpoint uses AI to identify and correct grammar, spelling, punctuation,
+    and capitalization errors while preserving the original meaning and style.
+    """
+    try:
+        logger.info(f"🔍 Grammar check requested for text: {request.text[:100]}...")
+        
+        result = azure_service.check_grammar(request.text)
+        
+        # Convert errors to GrammarError models
+        grammar_errors = [
+            GrammarError(
+                original=error.get("original", ""),
+                corrected=error.get("corrected", ""),
+                type=error.get("type", "grammar"),
+                explanation=error.get("explanation", "Grammar correction")
+            )
+            for error in result.get("errors", [])
+        ]
+        
+        response = GrammarCheckResponse(
+            corrected_text=result.get("corrected_text", request.text),
+            has_errors=result.get("has_errors", False),
+            errors=grammar_errors,
+            original_text=result.get("original_text", request.text)
+        )
+        
+        logger.info(f"✅ Grammar check completed. Errors found: {len(grammar_errors)}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"❌ Error checking grammar: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking grammar: {str(e)}"
+        )
+
+@app.post("/grammar/quick-check")
+async def quick_grammar_check(request: GrammarCheckRequest):
+    """
+    Quick grammar check - returns only corrected text (faster, lighter)
+    
+    This is a lightweight endpoint for real-time grammar checking while typing.
+    It returns only the corrected text without detailed error information.
+    """
+    try:
+        logger.info(f"⚡ Quick grammar check requested for text: {request.text[:100]}...")
+        
+        corrected_text = azure_service.quick_grammar_check(request.text)
+        
+        logger.info(f"✅ Quick grammar check completed")
+        return {
+            "corrected_text": corrected_text,
+            "has_errors": corrected_text != request.text,
+            "original_text": request.text
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error in quick grammar check: {str(e)}")
+        # Return original text on error
+        return {
+            "corrected_text": request.text,
+            "has_errors": False,
+            "original_text": request.text
+        }
