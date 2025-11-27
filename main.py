@@ -1,4 +1,4 @@
-from typing import Union, List, Dict, Any
+from typing import Union, List, Dict, Any, Optional
 import logging
 import os
 from dotenv import load_dotenv
@@ -2911,6 +2911,10 @@ class LocationExceptionRequest(BaseModel):
     approved_latitude: float
     approved_longitude: float
     distance_meters: float
+    question_guardrail: Optional[str] = None  # Guardrail for validation
+    guideline: Optional[str] = None  # Guideline to show to user
+    question_word_count: Optional[str] = None  # Word count requirement
+    master_guardrail: Optional[str] = None  # Master guardrail
 
 class LocationExceptionResponse(BaseModel):
     is_acceptable: bool
@@ -2940,67 +2944,33 @@ async def validate_location_explanation(request: LocationExceptionRequest):
         if not azure_service._initialized:
             azure_service._initialize_client()
         
-        # AI prompt for location explanation validation
-        validation_prompt = f"""You are validating a location exception explanation from a healthcare worker.
-
-WORKER'S EXPLANATION: "{request.explanation}"
-
-CONTEXT:
-- Worker is {request.distance_meters:.0f} meters away from approved client location
-- Worker is trying to start their shift
-
-VALIDATION RULES:
-
-✅ ACCEPT if explanation includes ALL of:
-1. Specific location name (e.g., "Dr. Smith's office", "Riverside Park", "client's doctor appointment")
-2. Legitimate reason (medical appointment, community activity, client request, family emergency)
-3. Authorization details (supervisor name, family member, client authorization)
-
-❌ REJECT if explanation is:
-- Vague ("I'm nearby", "running errands", "I don't know", "just here")
-- Missing key details (no location name, no reason, no authorization)
-- Incoherent or unclear
-- Generic excuses without specifics
-
-RESPONSE FORMAT (JSON):
-{{
-    "is_acceptable": true/false,
-    "status": "accept" or "reject",
-    "feedback": "Brief explanation of decision",
-    "missing_elements": ["list", "of", "missing", "elements"] (only if rejected)
-}}
-
-Return ONLY valid JSON, no other text."""
-
-        response = azure_service.client.chat.completions.create(
-            model=azure_service.deployment,
-            messages=[
-                {"role": "system", "content": "You are a location validation expert. Return only valid JSON."},
-                {"role": "user", "content": validation_prompt}
-            ],
-            max_tokens=300,
-            temperature=0.3
-        )
-        
-        result_text = response.choices[0].message.content.strip()
-        logger.info(f"📍 AI Response: {result_text}")
-        
-        # Parse JSON response
-        import json
-        try:
-            # Remove markdown code blocks if present
-            if result_text.startswith("```"):
-                result_text = result_text.split("```")[1]
-                if result_text.startswith("json"):
-                    result_text = result_text[4:]
-            result_text = result_text.strip()
+        # Use validate_answer_with_ai if guardrails are provided, otherwise use fallback
+        if request.question_guardrail:
+            logger.info(f"📍 Using guardrail-based validation")
+            logger.info(f"📍 Guardrail: {request.question_guardrail[:100]}...")
+            logger.info(f"📍 Guideline: {request.guideline[:100] if request.guideline else 'None'}...")
             
-            ai_result = json.loads(result_text)
+            # Use the standard validation function with guardrails
+            # For location exceptions, ONLY use question-specific guardrail and word count
+            # Do NOT use master guardrail or default word count guardrail
+            # q41_guardrail is required by validate_answer_with_ai, so we pass question_word_count as fallback
+            q41_guardrail_value = request.question_word_count or "20-50 words recommended"  # Minimal fallback for q41 requirement
             
-            is_acceptable = ai_result.get("is_acceptable", False)
-            status = ai_result.get("status", "reject")
-            feedback = ai_result.get("feedback", "Explanation needs more detail.")
-            missing_elements = ai_result.get("missing_elements", [])
+            validation_result = await validate_answer_with_ai(
+                user_answer=request.explanation,
+                question_guardrail=request.question_guardrail,
+                q41_guardrail=q41_guardrail_value,  # Required parameter - use question word count as fallback
+                question_word_count=request.question_word_count,
+                master_guardrail=None,  # Do NOT use master guardrail for location exceptions
+                default_word_count_guardrail=None,  # Do NOT use default word count for location exceptions
+                request_id=f"loc_exception_{request.client_id}_{request.dsw_id}"
+            )
+            
+            # Convert validation result to LocationExceptionResponse format
+            is_acceptable = validation_result.get("is_acceptable", False)
+            status = "accept" if is_acceptable else "reject"
+            feedback = validation_result.get("feedback", "Explanation needs more detail.")
+            missing_elements = validation_result.get("missing_elements", [])
             
             logger.info(f"📍 Validation Result: {status} - {feedback}")
             
@@ -3010,10 +2980,9 @@ Return ONLY valid JSON, no other text."""
                 feedback=feedback,
                 missing_elements=missing_elements
             )
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ Failed to parse AI response as JSON: {e}")
-            logger.error(f"❌ Raw response: {result_text}")
-            # Fallback: Use simple keyword-based validation
+        else:
+            # Fallback to simple keyword-based validation if no guardrails provided
+            logger.info(f"📍 Using fallback validation (no guardrails provided)")
             explanation_lower = request.explanation.lower()
             has_location = any(word in explanation_lower for word in ["location", "office", "appointment", "park", "home", "hospital", "clinic", "doctor"])
             has_reason = any(word in explanation_lower for word in ["appointment", "emergency", "request", "authorized", "supervisor", "family"])
