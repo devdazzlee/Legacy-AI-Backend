@@ -2230,6 +2230,18 @@ Step 4: Does answer contain relevant information about client/event/situation?
             if q41_guardrail:
                 guidelines_checked.append("Q41 general requirements (AI analyzed)")
 
+            # Convert AI status to is_acceptable boolean
+            ai_status = validation_data.get("status", "reject").lower()
+            is_acceptable = ai_status in ["approve", "accept", "approved", "accepted"]
+            
+            # If there are safety concerns, override to reject
+            if final_safety_concerns:
+                is_acceptable = False
+                normalized_status = "reject"
+            else:
+                # Normalize status to "accept" or "reject" to match frontend interface
+                normalized_status = "accept" if is_acceptable else "reject"
+
             result = {
                 "word_count": word_count,
                 "missing_elements": validation_data.get("missing_elements", []),
@@ -2238,7 +2250,10 @@ Step 4: Does answer contain relevant information about client/event/situation?
                 "ai_analysis": validation_data.get("analysis", ""),
                 "word_count_analysis": validation_data.get("word_count_analysis", ""),
                 "content_quality": validation_data.get("content_quality", ""),
-                "suggested_answer": suggested_answer
+                "suggested_answer": suggested_answer,
+                "is_acceptable": is_acceptable,
+                "status": normalized_status,
+                "feedback": validation_data.get("analysis", "")
             }
             
             logger.info("=" * 60)
