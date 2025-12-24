@@ -50,15 +50,15 @@ For Vercel deployment, add these as environment variables in your Vercel dashboa
 4. See `vercel-env-template.txt` for a complete list
 
 **Required Variables for Vercel:**
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_KEY`
-- `AZURE_OPENAI_API_VERSION`
-- `AZURE_OPENAI_DEPLOYMENT`
-- `AZURE_WHISPER_DEPLOYMENT`
-- `AZURE_WHISPER_ENDPOINT`
-- `AZURE_WHISPER_KEY`
-- `AZURE_WHISPER_API_VERSION`
-- `DATABASE_URL`
+- `ANTHROPIC_API_KEY` (or `CLAUDE_API_KEY`) - Anthropic Claude API key
+- `AZURE_OPENAI_ENDPOINT` - For Whisper speech-to-text
+- `AZURE_OPENAI_KEY` - For Whisper speech-to-text
+- `AZURE_OPENAI_API_VERSION` - For Whisper
+- `AZURE_WHISPER_DEPLOYMENT` - Whisper deployment name
+- `AZURE_WHISPER_ENDPOINT` - Whisper endpoint
+- `AZURE_WHISPER_KEY` - Whisper API key
+- `AZURE_WHISPER_API_VERSION` - Whisper API version
+- `DATABASE_URL` - PostgreSQL database URL
 
 **Optional Variables:**
 - `REDIS_URL` or `UPSTASH_REDIS_REST_URL` (for caching)

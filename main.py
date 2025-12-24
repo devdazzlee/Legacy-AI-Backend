@@ -5,11 +5,12 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from openai import AzureOpenAI, RateLimitError
+from anthropic import Anthropic
+from openai import AzureOpenAI  # Still needed for Whisper speech-to-text
 
-# Simple RateLimitError class for direct HTTP calls (when not using SDK)
+# Simple error class for request cancellation
 class SimpleRateLimitError(Exception):
-    """Simple rate limit error for direct HTTP calls"""
+    """Simple error class for request cancellation"""
     pass
 import uuid
 import asyncio
@@ -28,8 +29,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Azure OpenAI Chat API",
-    description="FastAPI application with Azure OpenAI integration",
+    title="Claude AI Chat API",
+    description="FastAPI application with Anthropic Claude integration",
     version="1.0.0"
 )
 
@@ -223,9 +224,9 @@ class RequestTracker:
 # Global request tracker
 request_tracker = RequestTracker()
 
-# Azure OpenAI Service
-class AzureOpenAIService:
-    """Service class for Azure OpenAI integration with hardcoded models"""
+# Claude AI Service
+class ClaudeService:
+    """Service class for Anthropic Claude integration using Claude Opus 4.5"""
     
     def __init__(self):
         self.client = None
@@ -233,359 +234,127 @@ class AzureOpenAIService:
         self.conversations = {}  # Store conversations in memory
         self.active_cancellations = {}  # request_id -> cancellation token
         
-        # Hardcoded models - 5 models configured directly in code
-        # All use the same API key
-        self.api_key = "47oYsTR8tSAcu3BJqsXDg4zZXLOcO1fY0uxhkR5fghe2NFmJm6A6JQQJ99BGACHYHv6XJ3w3AAAAACOG5jxP"
+        # Claude Opus 4.5 - Best model available
+        # Get API key from environment variable
+        self.api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "ANTHROPIC_API_KEY or CLAUDE_API_KEY environment variable is required. "
+                "Please set it in your .env file or environment variables."
+            )
         
-        # Model configurations - ordered by priority (tried in this order)
-        self.models = [
-            {
-                "name": "gpt-4o",
-                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
-                "deployment": "gpt-4o",
-                "api_version": "2025-01-01-preview"
-            },
-            {
-                "name": "o4-mini",
-                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
-                "deployment": "o4-mini",
-                "api_version": "2025-01-01-preview"
-            },
-            {
-                "name": "o3-mini",
-                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
-                "deployment": "o3-mini",
-                "api_version": "2025-01-01-preview"
-            },
-            {
-                "name": "gpt-35-turbo",
-                "endpoint": "https://hakeem-4411-resource.cognitiveservices.azure.com",
-                "deployment": "gpt-35-turbo",
-                "api_version": "2025-01-01-preview"
-            },
-            {
-                "name": "DeepSeek-R1",
-                "endpoint": "https://hakeem-4411-resource.services.ai.azure.com",
-                "deployment": "DeepSeek-R1",
-                "api_version": "2024-05-01-preview"
-            }
-        ]
+        # Claude Opus 4.5 - Premium model (best available)
+        self.model = "claude-opus-4-5-20251101"  # Claude Opus 4.5 (full model ID)
         
-        # Fallback deployment list - model names for easy reference
-        self.fallback_deployments = [model["name"] for model in self.models]
-        self.deployment = self.fallback_deployments[0]  # Primary deployment
+        # Max tokens for Claude Opus 4.5
+        self.max_tokens = 8192  # Claude Opus 4.5 supports up to 8192 output tokens
     
-    def _get_model_config(self, deployment_name: str = None):
-        """Get configuration for a specific model by name"""
-        model_name = deployment_name or self.deployment
-        for model in self.models:
-            if model["name"] == model_name:
-                return model
-        # Default to first model if not found
-        return self.models[0]
-    
-    def _get_model_token_params(self, model_name: str):
-        """
-        Get model-specific token parameters based on model requirements
-        
-        Returns:
-            dict with appropriate token parameter name and value
-        """
-        # Newer o-series models (o4-mini, o3-mini) require max_completion_tokens instead of max_tokens
-        if model_name in ['o4-mini', 'o3-mini']:
-            return {"max_completion_tokens": 4096}  # Conservative limit for o-series
-        
-        # gpt-35-turbo has a 4096 completion token limit
-        if model_name == 'gpt-35-turbo':
-            return {"max_tokens": 4096}  # Don't exceed model's limit
-        
-        # gpt-4o and other models can use max_tokens with higher limits
-        if model_name == 'gpt-4o':
-            return {"max_tokens": 16384}  # Higher limit for gpt-4o
-        
-        # DeepSeek-R1 uses max_tokens (different endpoint)
-        if model_name == 'DeepSeek-R1':
-            return {"max_tokens": 6553}  # Original value works for DeepSeek
-        
-        # Default fallback
-        return {"max_tokens": 4096}
-    
-    def _get_model_temperature(self, model_name: str):
-        """
-        Get model-specific temperature parameter based on model requirements
-        
-        Returns:
-            dict with temperature parameter or empty dict if not supported
-        """
-        # o4-mini only supports temperature: 1.0 (default value, must be explicitly set)
-        if model_name == 'o4-mini':
-            return {"temperature": 1.0}  # Must be 1.0, not 0.7
-        
-        # o3-mini does NOT support temperature parameter at all
-        if model_name == 'o3-mini':
-            return {}  # Don't include temperature parameter
-        
-        # All other models support temperature: 0.7
-        return {"temperature": 0.7}
-    
-    def _create_client_for_model(self, deployment_name: str = None):
-        """Create Azure OpenAI client for a specific model"""
-        model_config = self._get_model_config(deployment_name)
-        
-        # Disable automatic retries - we want to handle retries ourselves and move to next model immediately
-        import httpx
-        
-        # Create custom HTTP client with NO retries
-        http_client = httpx.Client(
-            timeout=httpx.Timeout(60.0),
-            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        )
-        
-        client = AzureOpenAI(
-            azure_endpoint=model_config["endpoint"],
-            api_key=self.api_key,
-            api_version=model_config["api_version"],
-            max_retries=0,  # Disable SDK automatic retries - we handle fallback manually
-            http_client=http_client  # Use custom client with no retries
-        )
-        
-        return client, model_config
-    
-    def _initialize_client(self, deployment_name: str = None):
-        """Initialize the Azure OpenAI client"""
+    def _initialize_client(self):
+        """Initialize the Anthropic Claude client"""
         try:
-            model_config = self._get_model_config(deployment_name)
+            # Verify API key is set
+            if not self.api_key or len(self.api_key) < 20:
+                raise ValueError("API key is missing or invalid")
             
-            # Disable automatic retries - we handle fallback manually
+            # Initialize Anthropic client
+            # Use custom http_client to avoid proxies parameter issue
+            # httpx may read proxy env vars and try to pass them, causing errors
             import httpx
+            # Create httpx client with explicit transport (no proxies)
+            transport = httpx.HTTPTransport()
+            http_client = httpx.Client(transport=transport, timeout=60.0)
             
-            # Create custom HTTP client with NO retries
-            http_client = httpx.Client(
-                timeout=httpx.Timeout(60.0),
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
-            )
-            
-            self.client = AzureOpenAI(
-                azure_endpoint=model_config["endpoint"],
-                api_key=self.api_key,
-                api_version=model_config["api_version"],
-                max_retries=0,  # Disable SDK automatic retries - we handle fallback manually
-                http_client=http_client  # Use custom client with no retries
-            )
-            
+            # Initialize Anthropic with custom http_client to bypass proxies issue
+            self.client = Anthropic(api_key=self.api_key, http_client=http_client)
             self._initialized = True
-            logger.info(f"Azure OpenAI client initialized successfully with model: {model_config['name']}")
-            
+            logger.info(f"✅ Claude client initialized successfully")
+            logger.info(f"📋 Model: {self.model}")
+            logger.info(f"🔑 API Key: {self.api_key[:20]}...{self.api_key[-10:]}")
         except Exception as e:
-            logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
+            logger.error(f"❌ Failed to initialize Claude client: {str(e)}")
+            logger.error(f"📋 Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"📋 Traceback: {traceback.format_exc()}")
             raise
     
     async def send_message(self, thread_id: str, message: str, deployment: str = None, request_id: str = None) -> str:
-        """Send a message to Azure OpenAI and get response - ONE MODEL AT A TIME"""
+        """Send a message to Claude and get response"""
         try:
             # Check if request is cancelled before starting
             if request_id and request_tracker.is_cancelled(request_id):
-                logger.warning(f"🚫 Request {request_id} is already cancelled - aborting call to {deployment}")
+                logger.warning(f"🚫 Request {request_id} is already cancelled")
                 raise SimpleRateLimitError(f"Request {request_id} was cancelled")
             
-            # Get model configuration
-            model_config = self._get_model_config(deployment)
+            # Initialize client if not already initialized
+            if not self._initialized:
+                self._initialize_client()
             
-            logger.info(f"🔒 Starting call to model: {model_config['name']} (endpoint: {model_config['endpoint']})")
+            logger.info(f"🔒 Starting call to Claude Opus 4.5")
             if request_id:
                 logger.info(f"📋 Request ID: {request_id}")
             
-            # Initialize conversation history if not exists (keyed by model name)
-            conversation_key = f"{thread_id}-{model_config['name']}"
-            if conversation_key not in self.conversations:
-                self.conversations[conversation_key] = [
-                    {
-                        "role": "system",
-                        "content": "You are an AI assistant that helps people find information."
-                    }
-                ]
+            # Initialize conversation history if not exists
+            if thread_id not in self.conversations:
+                self.conversations[thread_id] = []
             
-            # Add user message to conversation
-            self.conversations[conversation_key].append({
+            # Convert conversation history to Claude format
+            # Claude uses "user" and "assistant" roles (no system role in messages)
+            messages = []
+            system_message = "You are an AI assistant that helps people find information."
+            
+            # Add existing conversation history
+            for msg in self.conversations[thread_id]:
+                if msg["role"] == "system":
+                    system_message = msg["content"]
+                else:
+                    messages.append({
+                        "role": msg["role"],
+                        "content": msg["content"]
+                    })
+            
+            # Add current user message
+            messages.append({
                 "role": "user",
                 "content": message
             })
             
-            # Get response from Azure OpenAI - DIRECT HTTP CALL to bypass SDK retry logic
-            # Use deployment name from model config
-            try:
-                logger.info(f"⏳ Waiting for response from {model_config['name']}...")
-                
-                # Make DIRECT HTTP request to bypass SDK retry logic
-                # This way we catch 429 errors immediately and move to next model
-                import httpx
-                import json
-                
-                # Build the API URL - handle different endpoint formats
-                endpoint = model_config['endpoint'].rstrip('/')
-                
-                if model_config['name'] == 'DeepSeek-R1':
-                    # DeepSeek-R1 uses different endpoint format
-                    api_url = f"{endpoint}/models/chat/completions?api-version={model_config['api_version']}"
-                else:
-                    # Standard Azure OpenAI chat completion format
-                    api_url = f"{endpoint}/openai/deployments/{model_config['deployment']}/chat/completions?api-version={model_config['api_version']}"
-                
-                # Prepare the request payload
-                # Different models may need different parameters
-                # Get model-specific token parameters
-                token_params = self._get_model_token_params(model_config['name'])
-                # Get model-specific temperature parameters (some models have restrictions)
-                temp_params = self._get_model_temperature(model_config['name'])
-                
-                if model_config['name'] == 'DeepSeek-R1':
-                    payload = {
-                        "model": model_config["deployment"],
-                        "messages": self.conversations[conversation_key],
-                        **token_params,  # Use model-specific token params
-                        **temp_params,  # Use model-specific temperature params
-                    }
-                else:
-                    # For Azure OpenAI deployments, use minimal payload
-                    # Use model-specific token parameters (max_tokens or max_completion_tokens)
-                    # Use model-specific temperature parameters (some models don't support it)
-                    payload = {
-                        "messages": self.conversations[conversation_key],
-                        **token_params,  # Use model-specific token params
-                        **temp_params,  # Use model-specific temperature params
-                    }
-                    
-                    # Only add optional parameters for models that support them
-                    # Avoid top_p, frequency_penalty, presence_penalty if they cause 400 errors
-                    # These will be tried without them first
-                
-                # Make direct HTTP request - NO SDK, NO RETRIES
-                # This bypasses all SDK retry logic - 429 errors caught immediately
-                logger.info(f"🌐 Making DIRECT HTTP request to {api_url} (NO SDK, NO RETRIES)")
-                logger.info(f"⚠️ Using DIRECT httpx call - SDK will NOT be used, NO automatic retries!")
-                logger.info(f"📤 Payload being sent to {model_config['name']}:")
-                logger.info(f"   - Messages count: {len(self.conversations[conversation_key])}")
-                # Log token parameter (could be max_tokens or max_completion_tokens)
-                token_param_value = payload.get('max_tokens') or payload.get('max_completion_tokens', 'N/A')
-                token_param_name = 'max_completion_tokens' if 'max_completion_tokens' in payload else 'max_tokens'
-                logger.info(f"   - {token_param_name}: {token_param_value}")
-                # Log temperature (some models don't support it)
-                if 'temperature' in payload:
-                    logger.info(f"   - Temperature: {payload.get('temperature', 'N/A')}")
-                else:
-                    logger.info(f"   - Temperature: Not included (model doesn't support it)")
-                logger.info(f"   - Payload keys: {list(payload.keys())}")
-                
-                # Check if request cancelled before making HTTP call
-                if request_id and request_tracker.is_cancelled(request_id):
-                    logger.warning(f"🚫 Request {request_id} cancelled before HTTP call - aborting")
-                    raise SimpleRateLimitError(f"Request {request_id} was cancelled")
-                
-                async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as http_client:
-                    try:
-                        http_response = await http_client.post(
-                            api_url,
-                            headers={
-                                "api-key": self.api_key,
-                                "Content-Type": "application/json"
-                            },
-                            json=payload
-                        )
-                        
-                        logger.info(f"📊 HTTP Response Status: {http_response.status_code} from {model_config['name']}")
-                        
-                        # Check if request cancelled after HTTP call (but before processing)
-                        if request_id and request_tracker.is_cancelled(request_id):
-                            logger.warning(f"🚫 Request {request_id} was cancelled after HTTP call - ignoring response")
-                            raise SimpleRateLimitError(f"Request {request_id} was cancelled")
-                        
-                        # Check for 429 IMMEDIATELY - BEFORE ANYTHING ELSE
-                        # This must be checked FIRST to prevent any retries
-                        if http_response.status_code == 429:
-                            error_body = http_response.text[:200] if http_response.text else "No error body"
-                            logger.error(f"🚫🚫🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO SDK RETRIES, moving to next model NOW!")
-                            logger.error(f"🚫 Rate limit detected - Status Code: 429, Error: {error_body}")
-                            logger.error(f"🛑 IMMEDIATELY raising RateLimitError - NO DELAYS, NO RETRIES!")
-                            # Use SimpleRateLimitError for direct HTTP calls (doesn't require SDK parameters)
-                            raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: HTTP 429")
-                        
-                        # Raise for other HTTP errors (non-429)
-                        if http_response.status_code >= 400:
-                            error_body = http_response.text[:500] if http_response.text else "No error body"
-                            status_code = http_response.status_code
-                            
-                            logger.error(f"=" * 80)
-                            logger.error(f"❌ HTTP ERROR on {model_config['name']}")
-                            logger.error(f"=" * 80)
-                            logger.error(f"📊 HTTP Status Code: {status_code}")
-                            logger.error(f"📊 Error Body: {error_body}")
-                            logger.error(f"📊 Endpoint: {api_url}")
-                            logger.error(f"📊 Model: {model_config['name']}")
-                            logger.error(f"📊 Deployment: {model_config['deployment']}")
-                            
-                            if status_code == 400:
-                                logger.error(f"📊 Reason: Bad Request - Invalid request format or parameters")
-                                logger.error(f"📊 Possible causes:")
-                                logger.error(f"   - Deployment '{model_config['deployment']}' does not exist")
-                                logger.error(f"   - Deployment exists but is not configured for chat completions")
-                                logger.error(f"   - API version mismatch (current: {model_config['api_version']})")
-                                logger.error(f"   - Invalid payload format for this deployment")
-                            elif status_code == 401:
-                                logger.error(f"📊 Reason: Unauthorized - Invalid API key or authentication")
-                            elif status_code == 404:
-                                logger.error(f"📊 Reason: Not Found - Deployment '{model_config['deployment']}' not found")
-                                logger.error(f"📊 Action: This deployment does not exist in your Azure OpenAI resource")
-                                logger.error(f"📊 Check Azure Portal to verify deployment exists")
-                            elif status_code == 500:
-                                logger.error(f"📊 Reason: Internal Server Error - Azure OpenAI server error")
-                            else:
-                                logger.error(f"📊 Reason: HTTP {status_code} error")
-                            
-                            logger.error(f"=" * 80)
-                            http_response.raise_for_status()
-                        
-                        # Parse the response
-                        response_data = http_response.json()
-                        response_content = response_data["choices"][0]["message"]["content"]
-                        
-                    except httpx.HTTPError as e:
-                        error_str = str(e).lower()
-                        if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                            logger.error(f"🚫🚫🚫 HTTP Error contains rate limit - IMMEDIATELY raising RateLimitError!")
-                            raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: HTTP error: {str(e)}")
-                        
-                        logger.error(f"=" * 80)
-                        logger.error(f"❌ HTTP ERROR EXCEPTION on {model_config['name']}")
-                        logger.error(f"=" * 80)
-                        logger.error(f"📊 Error Type: {type(e).__name__}")
-                        logger.error(f"📊 Error Message: {str(e)[:500]}")
-                        logger.error(f"📊 Full Error: {str(e)}")
-                        logger.error(f"=" * 80)
-                        raise Exception(f"HTTP error on {model_config['name']}: {str(e)}")
-                
-                logger.info(f"✅ Successfully received response from {model_config['name']} ({model_config['deployment']})")
-            except (RateLimitError, SimpleRateLimitError) as e:
-                logger.error(f"🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO delays, moving to next model NOW!")
-                logger.warning(f"❌ Rate limit error (429) in send_message for {model_config['name']}: {str(e)}")
-                logger.warning("⚠️ Azure OpenAI rate limit exceeded. Canceling this model and trying next model immediately.")
-                raise  # Re-raise to let the caller handle retries with next model
-            except Exception as e:
-                error_str = str(e).lower()
-                if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                    logger.error(f"🚫 IMMEDIATELY caught Rate limit (429) on {model_config['name']} - NO delays, moving to next model NOW!")
-                    logger.error(f"❌ Rate limit detected in send_message for {model_config['name']}: {str(e)}")
-                    logger.warning("⚠️ Azure OpenAI rate limit exceeded. Canceling this model and trying next model immediately.")
-                    # Re-raise as SimpleRateLimitError for consistent handling (doesn't require SDK parameters)
-                    raise SimpleRateLimitError(f"Rate limit on {model_config['name']}: {str(e)}")
-                raise  # Re-raise other errors
+            logger.info(f"⏳ Waiting for response from Claude Opus 4.5...")
+            logger.info(f"📤 Messages count: {len(messages)}")
             
-            # Add assistant response to conversation
-            self.conversations[conversation_key].append({
+            # Check if request cancelled before making API call
+            if request_id and request_tracker.is_cancelled(request_id):
+                logger.warning(f"🚫 Request {request_id} cancelled before API call - aborting")
+                raise SimpleRateLimitError(f"Request {request_id} was cancelled")
+            
+            # Call Claude API
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                temperature=0.7,
+                system=system_message,
+                messages=messages
+            )
+            
+            # Check if request cancelled after getting response
+            if request_id and request_tracker.is_cancelled(request_id):
+                logger.warning(f"🚫 Request {request_id} was cancelled after getting response - ignoring response")
+                raise SimpleRateLimitError(f"Request {request_id} was cancelled")
+                        
+            # Extract response content
+            response_content = response.content[0].text
+            
+            # Add user message and assistant response to conversation
+            self.conversations[thread_id].append({
+                "role": "user",
+                "content": message
+            })
+            self.conversations[thread_id].append({
                 "role": "assistant",
                 "content": response_content
             })
             
-            logger.info(f"🔓 Completed call to model: {model_config['name']}")
+            logger.info(f"✅ Successfully received response from Claude Opus 4.5")
+            logger.info(f"🔓 Completed call to Claude Opus 4.5")
             return response_content
             
         except Exception as e:
@@ -602,11 +371,8 @@ class AzureOpenAIService:
     def validate_response_detail(self, response: str, question_type: str = "day_description") -> Dict[str, Any]:
         """Validate if a response is detailed enough and provide suggestions"""
         try:
-            # Get model configuration (use first model as primary)
-            model_config = self._get_model_config(self.deployment)
-            
-            # Create client for this specific model
-            client, _ = self._create_client_for_model(self.deployment)
+            if not self._initialized:
+                self._initialize_client()
             
             # Create a validation prompt based on question type
             if question_type == "day_description":
@@ -647,30 +413,22 @@ Examples of BAD suggestions (instructions - DO NOT DO THIS):
 CRITICAL: Return only valid JSON. Do not include any text before or after the JSON object.
 """
             
-            # Get validation from Azure OpenAI
-            validation_response = client.chat.completions.create(
-                model=model_config["deployment"],
+            # Get validation from Claude
+            validation_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                temperature=0.3,
+                system="You are a helpful healthcare assistant that validates response quality and provides constructive feedback.",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful healthcare assistant that validates response quality and provides constructive feedback."
-                    },
                     {
                         "role": "user",
                         "content": validation_prompt
                     }
-                ],
-                max_tokens=500,
-                temperature=0.3,
-                top_p=0.95,
-                frequency_penalty=0,
-                presence_penalty=0,
-                stop=None,
-                stream=False
+                ]
             )
             
             # Parse the response
-            response_content = validation_response.choices[0].message.content.strip()
+            response_content = validation_response.content[0].text.strip()
             logger.info(f"AI Response Content: {response_content}")
             
             # Try to parse JSON response
@@ -795,30 +553,22 @@ Examples of BAD suggestions (instructions - DO NOT DO THIS):
 CRITICAL: Return only valid JSON. Do not include any text before or after the JSON object.
 """
 
-            # Get validation from Azure OpenAI
-            validation_response = self.client.chat.completions.create(
-                model=self.deployment,
+            # Get validation from Claude
+            validation_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                temperature=0.3,
+                system="You are a helpful healthcare assistant that validates response relevance to services and provides constructive feedback.",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful healthcare assistant that validates response relevance to services and provides constructive feedback."
-                    },
                     {
                         "role": "user",
                         "content": validation_prompt
                     }
-                ],
-                max_tokens=500,
-                temperature=0.3,
-                top_p=0.95,
-                frequency_penalty=0,
-                presence_penalty=0,
-                stop=None,
-                stream=False
+                ]
             )
 
             # Parse the response
-            response_content = validation_response.choices[0].message.content.strip()
+            response_content = validation_response.content[0].text.strip()
             logger.info(f"AI Service Validation Response Content: {response_content}")
 
             # Try to parse JSON response
@@ -916,29 +666,21 @@ IMPORTANT:
 Respond with helpful guidance only, no additional formatting or explanations.
 """
 
-            # Get response from Azure OpenAI
-            chatbot_response = self.client.chat.completions.create(
-                model=self.deployment,
+            # Get response from Claude
+            chatbot_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=800,
+                temperature=0.3,
+                system="You are a helpful healthcare documentation assistant that provides clear, actionable guidance for progress log completion.",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful healthcare documentation assistant that provides clear, actionable guidance for progress log completion."
-                    },
                     {
                         "role": "user",
                         "content": chatbot_prompt
                     }
-                ],
-                max_tokens=800,
-                temperature=0.3,
-                top_p=0.95,
-                frequency_penalty=0,
-                presence_penalty=0,
-                stop=None,
-                stream=False
+                ]
             )
 
-            response_content = chatbot_response.choices[0].message.content.strip()
+            response_content = chatbot_response.content[0].text.strip()
             logger.info(f"Chatbot Response: {response_content}")
             
             return response_content
@@ -1030,16 +772,16 @@ Write as if you are the healthcare worker documenting the actual incident. Be sp
 Return ONLY the example message, no other text.
 """
                 
-                example_response = self.client.chat.completions.create(
-                    model=self.deployment,
-                    messages=[
-                        {"role": "system", "content": "You are a healthcare documentation expert. Provide detailed example messages."},
-                        {"role": "user", "content": example_prompt}
-                    ],
+                example_response = self.client.messages.create(
+                    model=self.model,
                     max_tokens=400,
-                    temperature=0.7
+                    temperature=0.7,
+                    system="You are a healthcare documentation expert. Provide detailed example messages.",
+                    messages=[
+                        {"role": "user", "content": example_prompt}
+                    ]
                 )
-                example_message = example_response.choices[0].message.content.strip()
+                example_message = example_response.content[0].text.strip()
                 
             elif is_too_short or is_vague or lacks_detail or lacks_specifics:
                 status = "rejected"
@@ -1074,16 +816,16 @@ Create a realistic EXAMPLE that the user CANNOT submit directly - they must writ
 Return ONLY the example message (no labels, no extra text).
 """
                 
-                example_response = self.client.chat.completions.create(
-                    model=self.deployment,
-                    messages=[
-                        {"role": "system", "content": "You are a healthcare documentation expert. Provide detailed example messages."},
-                        {"role": "user", "content": example_prompt}
-                    ],
+                example_response = self.client.messages.create(
+                    model=self.model,
                     max_tokens=250,
-                    temperature=0.7
+                    temperature=0.7,
+                    system="You are a healthcare documentation expert. Provide detailed example messages.",
+                    messages=[
+                        {"role": "user", "content": example_prompt}
+                    ]
                 )
-                example_message = example_response.choices[0].message.content.strip()
+                example_message = example_response.content[0].text.strip()
                 
             else:
                 # Message is detailed enough - APPROVE
@@ -1157,29 +899,21 @@ Text to check:
 
 Provide the corrected version of the text. Return ONLY the corrected text without any explanations, notes, or additional formatting."""
 
-            # Get grammar check from Azure OpenAI
-            grammar_response = self.client.chat.completions.create(
-                model=self.deployment,
+            # Get grammar check from Claude
+            grammar_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                temperature=0.1,  # Low temperature for consistent corrections
+                system="You are an expert grammar and language checker. You correct grammar, spelling, punctuation, and capitalization errors while preserving the original meaning and style.",
                 messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert grammar and language checker. You correct grammar, spelling, punctuation, and capitalization errors while preserving the original meaning and style."
-                    },
                     {
                         "role": "user",
                         "content": grammar_prompt
                     }
-                ],
-                max_tokens=2000,
-                temperature=0.1,  # Low temperature for consistent corrections
-                top_p=0.95,
-                frequency_penalty=0,
-                presence_penalty=0,
-                stop=None,
-                stream=False
+                ]
             )
 
-            corrected_text = grammar_response.choices[0].message.content.strip()
+            corrected_text = grammar_response.content[0].text.strip()
             
             # Remove any quotes if AI wrapped the response
             if corrected_text.startswith('"') and corrected_text.endswith('"'):
@@ -1279,7 +1013,7 @@ Provide the corrected version of the text. Return ONLY the corrected text withou
             return text
 
 # Initialize service
-azure_service = AzureOpenAIService()
+claude_service = ClaudeService()
 
 # Initialize AI Prescreener system components
 ai_prescreener = None
@@ -1296,7 +1030,7 @@ mobile_service = None
 #         # from alert_system import RealTimeAlertSystem
 #         # from mobile_integration import MobileAIPrescreenerService
         
-#         ai_prescreener = AIPrescreenerCore(azure_service)
+#         ai_prescreener = AIPrescreenerCore(claude_service)
 #         alert_system = RealTimeAlertSystem(db_manager)
 #         mobile_service = MobileAIPrescreenerService()
         
@@ -2301,23 +2035,17 @@ Step 4: Does answer contain relevant information about client/event/situation?
 
 async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int = 60, request_id: str = None) -> str:
     """
-    Call Azure OpenAI model for validation analysis with automatic fallback
-    Tries multiple models ONE AT A TIME (sequential) - waits for each model to complete before trying next
+    Call Claude Opus 4.5 model for validation analysis
     
     Args:
         prompt: The prompt to send to the AI model
-        max_retries: Maximum number of retries per model (default 1, no retries - just try next model)
+        max_retries: Maximum number of retries (default 1)
         timeout_seconds: Timeout in seconds per model request (default 60s)
         request_id: Optional request ID for tracking and cancellation
     """
-    # Get list of fallback deployments (hardcoded 5 models)
-    deployments_to_try = azure_service.fallback_deployments.copy()
-    last_error = None
-    model_attempts = []  # Track each model attempt for summary
-    
     # Check if request is cancelled before starting
     if request_id and request_tracker.is_cancelled(request_id):
-        logger.warning(f"🚫 Request {request_id} is already cancelled - aborting model fallback")
+        logger.warning(f"🚫 Request {request_id} is already cancelled - aborting")
         return """{"status": "reject", "missing_elements": ["Request was cancelled"], "safety_concerns": [], "analysis": "Request was cancelled.", "word_count_analysis": "", "content_quality": ""}"""
     
     # Check if request is too old (late request)
@@ -2325,296 +2053,77 @@ async def call_ai_model(prompt: str, max_retries: int = 1, timeout_seconds: int 
         logger.warning(f"⏰ Request {request_id} is too old - ignoring late request")
         return """{"status": "reject", "missing_elements": ["Request expired"], "safety_concerns": [], "analysis": "Request expired. Please try again.", "word_count_analysis": "", "content_quality": ""}"""
     
-    logger.info(f"🔄 Starting sequential model fallback. Available models: {deployments_to_try}")
-    logger.info(f"📋 Will try models ONE AT A TIME in this order: 1) {deployments_to_try[0]}, 2) {deployments_to_try[1]}, 3) {deployments_to_try[2]}, 4) {deployments_to_try[3]}, 5) {deployments_to_try[4]}")
-    logger.info(f"⚠️ IMPORTANT: If first model succeeds, will NOT try other models!")
-    logger.info(f"⚠️ IMPORTANT: If first model errors, will IMMEDIATELY cancel and try next model!")
+    logger.info(f"🔄 Starting Claude Opus 4.5 call")
     if request_id:
         logger.info(f"📋 Request ID: {request_id} (tracking enabled)")
     
-    # Try each deployment in order - ONE AT A TIME
-    # Exit immediately if first model succeeds
-    for deployment_idx, deployment in enumerate(deployments_to_try):
-        # Check if request cancelled before trying each model
-        if request_id and request_tracker.is_cancelled(request_id):
-            logger.warning(f"🚫 Request {request_id} cancelled during fallback - aborting")
-            break
-        logger.info(f"=" * 80)
-        logger.info(f"🤖 [MODEL {deployment_idx + 1}/{len(deployments_to_try)}] Attempting: {deployment}")
-        logger.info(f"=" * 80)
-        logger.info(f"📋 Starting attempt for model: {deployment}")
-        logger.info(f"📋 Previous attempts: {len(model_attempts)} models tried so far")
-        if model_attempts:
-            logger.info(f"📋 Previous results:")
-            for attempt in model_attempts:
-                status_icon = "✅" if attempt["status"] == "success" else "❌"
-                logger.info(f"   {status_icon} {attempt['model']}: {attempt['status']} - {attempt.get('message', 'N/A')[:50]}")
-        logger.info(f"=" * 80)
-        
-        retry_count = 0
-        
-        while retry_count <= max_retries:
+    retry_count = 0
+    last_error = None
+    
+    while retry_count <= max_retries:
+        try:
+            logger.info(f"📞 Calling Claude Opus 4.5... (attempt {retry_count + 1}/{max_retries + 1})")
+            
+            # Create a thread for this validation request
+            thread_id = f"validation-thread-{uuid.uuid4()}"
+            
+            # Check if request cancelled before making call
+            if request_id and request_tracker.is_cancelled(request_id):
+                logger.warning(f"🚫 Request {request_id} cancelled before calling Claude - aborting")
+                break
+            
+            # AWAIT ensures this model call completes
+            # Add timeout to prevent hanging requests
             try:
-                # Call Azure OpenAI with specific deployment - AWAIT ensures this completes before next model
-                logger.info(f"📞 Calling {deployment}... (attempt {retry_count + 1}/{max_retries + 1})")
+                response = await asyncio.wait_for(
+                    claude_service.send_message(thread_id, prompt, request_id=request_id),
+                    timeout=timeout_seconds
+                )
                 
-                # Create a thread for this validation request (unique per deployment)
-                thread_id = f"validation-thread-{deployment}"
-                
-                # Check if request cancelled before making call
+                # Check if request cancelled after getting response
                 if request_id and request_tracker.is_cancelled(request_id):
-                    logger.warning(f"🚫 Request {request_id} cancelled before calling {deployment} - aborting")
+                    logger.warning(f"🚫 Request {request_id} was cancelled after getting response - ignoring response")
                     break
                 
-                # AWAIT ensures this model call completes (success or failure) before moving to next model
-                # Add timeout to prevent hanging requests
-                try:
-                    response = await asyncio.wait_for(
-                        azure_service.send_message(thread_id, prompt, deployment=deployment, request_id=request_id),
-                        timeout=timeout_seconds
-                    )
-                    
-                    # Check if request cancelled after getting response (but before returning)
-                    if request_id and request_tracker.is_cancelled(request_id):
-                        logger.warning(f"🚫 Request {request_id} was cancelled after getting response from {deployment} - ignoring response")
-                        # Don't return - continue to next model or fallback
-                        if deployment_idx < len(deployments_to_try) - 1:
-                            break  # Try next model
-                        else:
-                            break  # All models tried
-                    
-                except asyncio.TimeoutError:
-                    logger.error(f"⏰ {deployment} timed out after {timeout_seconds} seconds")
-                    # Track timeout failure
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Timeout after {timeout_seconds} seconds"
-                    })
-                    # Check if cancelled during timeout
-                    if request_id and request_tracker.is_cancelled(request_id):
-                        logger.warning(f"🚫 Request {request_id} cancelled during timeout - aborting")
-                        break
-                    raise Exception(f"Request to {deployment} timed out after {timeout_seconds}s")
-                
-                # CRITICAL: If we get here, the model responded successfully
-                # Exit immediately - DO NOT try next models
-                if response and len(str(response).strip()) > 0:
-                    logger.info(f"✅ SUCCESS! Received valid response from {deployment}")
-                    logger.info(f"🎯 Using response from model: {deployment}")
-                    logger.info(f"🛑 EXITING IMMEDIATELY - First model succeeded! NOT trying other models!")
-                    logger.info(f"✋ STOPPING fallback process - response received from model {deployment_idx + 1}")
-                    
-                    # Track successful attempt
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "success",
-                        "message": "Successfully received response"
-                    })
-                    
-                    # Print summary of all attempts
-                    logger.info(f"=" * 80)
-                    logger.info(f"📊 MODEL ATTEMPT SUMMARY")
-                    logger.info(f"=" * 80)
-                    for i, attempt in enumerate(model_attempts, 1):
-                        status_icon = "✅" if attempt["status"] == "success" else "❌"
-                        logger.info(f"{status_icon} Model {i}: {attempt['model']} - {attempt['status']} - {attempt.get('message', 'N/A')}")
-                    logger.info(f"=" * 80)
-                    
-                    # CRITICAL: Return immediately - this exits the entire function
-                    # No other models will be tried after this return
-                    return response
-                else:
-                    # Empty response - treat as error and try next model
-                    logger.warning(f"⚠️ {deployment} returned empty response. Trying next model...")
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": "Empty response from model"
-                    })
-                    break  # Break inner loop to try next deployment
-                    
-            except (RateLimitError, SimpleRateLimitError) as e:
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ Claude Opus 4.5 timed out after {timeout_seconds} seconds")
+                if request_id and request_tracker.is_cancelled(request_id):
+                    logger.warning(f"🚫 Request {request_id} cancelled during timeout - aborting")
+                    break
+                raise Exception(f"Request timed out after {timeout_seconds}s")
+            
+            # If we get here, the model responded successfully
+            if response and len(str(response).strip()) > 0:
+                logger.info(f"✅ SUCCESS! Received valid response from Claude Opus 4.5")
+                return response
+            else:
+                # Empty response - retry
+                logger.warning(f"⚠️ Claude Opus 4.5 returned empty response. Retrying...")
                 retry_count += 1
-                last_error = e
+                continue
                 
-                logger.error(f"=" * 80)
-                logger.error(f"🚫 RATE LIMIT ERROR on {deployment}")
-                logger.error(f"=" * 80)
-                logger.error(f"📊 Error Type: {type(e).__name__}")
-                logger.error(f"📊 Error Message: {str(e)}")
-                logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
-                logger.error(f"📊 HTTP Status: 429 Too Many Requests")
-                logger.error(f"📊 Reason: Azure OpenAI rate limit exceeded for {deployment}")
-                logger.error(f"=" * 80)
-                
-                # Track failed attempt
-                if retry_count > max_retries:
-                    model_attempts.append({
-                        "model": deployment,
-                        "status": "failed",
-                        "message": f"Rate limit (429) - exhausted {max_retries} retries"
-                    })
-                
-                if retry_count <= max_retries:
-                    # If Azure rate limits on this model, try again immediately (no wait)
-                    logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
-                    continue
-                else:
-                    # If this model exhausted retries, cancel and try next deployment immediately
-                    logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
-                    break  # Break inner loop - cancel remaining retries and try next deployment
-                    
-            except Exception as e:
-                last_error = e
-                error_str = str(e).lower()
-                
-                # Check if it's a rate limit error by status code
-                if "429" in error_str or "rate limit" in error_str or "too many requests" in error_str:
-                    retry_count += 1
-                    
-                    logger.error(f"=" * 80)
-                    logger.error(f"🚫 RATE LIMIT DETECTED on {deployment}")
-                    logger.error(f"=" * 80)
-                    logger.error(f"📊 Error Type: {type(e).__name__}")
-                    logger.error(f"📊 Error Message: {str(e)[:500]}")
-                    logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
-                    logger.error(f"📊 HTTP Status: 429 (detected in error message)")
-                    logger.error(f"=" * 80)
-                    
-                    if retry_count <= max_retries:
-                        # If Azure rate limits, try again immediately (no wait)
-                        logger.warning(f"🔄 Retrying {deployment} immediately... (attempt {retry_count}/{max_retries})")
-                        continue
-                    else:
-                        # If this model exhausted retries, cancel and try next deployment immediately
-                        logger.warning(f"⚠️ {deployment} exhausted all retries. Canceling retries and moving to next model...")
-                        break  # Break inner loop - cancel remaining retries and try next deployment
-                else:
-                    # Non-rate-limit error - Log detailed error information
-                    logger.error(f"=" * 80)
-                    logger.error(f"❌ MODEL FAILURE on {deployment}")
-                    logger.error(f"=" * 80)
-                    logger.error(f"📊 Error Type: {type(e).__name__}")
-                    logger.error(f"📊 Error Message: {str(e)[:500]}")
-                    logger.error(f"📊 Full Error: {str(e)}")
-                    
-                    # Check for specific error types
-                    if "400" in error_str or "bad request" in error_str:
-                        logger.error(f"📊 HTTP Status: 400 Bad Request")
-                        logger.error(f"📊 Reason: Invalid request format or parameters for {deployment}")
-                    elif "404" in error_str or "not found" in error_str:
-                        logger.error(f"📊 HTTP Status: 404 Not Found")
-                        logger.error(f"📊 Reason: Deployment '{deployment}' not found in Azure OpenAI")
-                    elif "401" in error_str or "unauthorized" in error_str:
-                        logger.error(f"📊 HTTP Status: 401 Unauthorized")
-                        logger.error(f"📊 Reason: Invalid API key or authentication failed")
-                    elif "500" in error_str or "internal server error" in error_str:
-                        logger.error(f"📊 HTTP Status: 500 Internal Server Error")
-                        logger.error(f"📊 Reason: Azure OpenAI server error")
-                    else:
-                        logger.error(f"📊 HTTP Status: Unknown")
-                        logger.error(f"📊 Reason: {str(e)[:200]}")
-                    
-                    logger.error(f"=" * 80)
-                    
-                    # Track failed attempt
-                    error_message = str(e)[:200] if str(e) else "Unknown error"
-                    if "400" in error_str or "bad request" in error_str:
-                        model_attempts.append({
-                            "model": deployment,
-                            "status": "failed",
-                            "message": f"Bad Request (400) - {error_message}"
-                        })
-                    elif "404" in error_str or "not found" in error_str:
-                        model_attempts.append({
-                            "model": deployment,
-                            "status": "failed",
-                            "message": f"Not Found (404) - Deployment not found"
-                        })
-                    elif "401" in error_str or "unauthorized" in error_str:
-                        model_attempts.append({
-                            "model": deployment,
-                            "status": "failed",
-                            "message": f"Unauthorized (401) - Authentication failed"
-                        })
-                    elif "500" in error_str or "internal server error" in error_str:
-                        model_attempts.append({
-                            "model": deployment,
-                            "status": "failed",
-                            "message": f"Server Error (500) - {error_message}"
-                        })
-                    else:
-                        model_attempts.append({
-                            "model": deployment,
-                            "status": "failed",
-                            "message": f"Error - {error_message}"
-                        })
-                    
-                    # Non-rate-limit error - IMMEDIATELY cancel and try next deployment
-                    # Don't retry - just move to next model immediately
-                    logger.warning(f"🛑 Canceling {deployment} - NOT retrying. Moving to next model immediately...")
-                    break  # Break inner loop immediately - cancel any retries, try next model
-        
-        # If we get here, this deployment failed - try next one (if available)
-        # CANCEL current model and wait 10 seconds before trying next model
-        # This delay ensures any in-flight requests fully fail/cancel before trying next model
-        # This prevents late responses from causing issues on the frontend
-        # Also allows time to see each model's logs and understand why it failed
-        if deployment_idx < len(deployments_to_try) - 1:
-            next_model = deployments_to_try[deployment_idx + 1]
-            logger.info(f"=" * 80)
-            logger.info(f"🔄 {deployment} FAILED - Moving to next model")
-            logger.info(f"=" * 80)
-            logger.info(f"📊 FAILURE SUMMARY for {deployment}:")
-            logger.info(f"   - Status: Failed or Rate Limited")
-            logger.info(f"   - Last Error: {str(last_error)[:200] if last_error else 'Unknown'}")
-            logger.info(f"   - Retries Attempted: {retry_count}")
-            logger.info(f"🚫 Previous request to {deployment} has been canceled/abandoned")
-            logger.info(f"⏳ Waiting 10 seconds before trying {next_model}...")
-            logger.info(f"   This allows time to see {deployment} logs and ensure cancellation")
-            logger.info(f"=" * 80)
+        except Exception as e:
+            last_error = e
+            retry_count += 1
             
-            # Wait 10 seconds to ensure any in-flight request fully cancels/fails
-            # This prevents late responses from causing duplicate responses on frontend
-            # Also allows time to review logs for each model
-            for wait_second in range(1, 11):
-                await asyncio.sleep(1)
-                if wait_second % 2 == 0:  # Log every 2 seconds
-                    logger.info(f"⏳ Waiting... ({wait_second}/10 seconds)")
+            logger.error(f"❌ ERROR on Claude Opus 4.5")
+            logger.error(f"📊 Error Type: {type(e).__name__}")
+            logger.error(f"📊 Error Message: {str(e)[:500]}")
+            logger.error(f"📊 Retry Count: {retry_count}/{max_retries}")
             
-            logger.info(f"=" * 80)
-            logger.info(f"➡️ NOW Starting request to {next_model} after 10 second delay...")
-            logger.info(f"=" * 80)
-            continue
-        else:
-            # All deployments exhausted - Print final summary
-            logger.error(f"=" * 80)
-            logger.error(f"❌ ALL MODELS EXHAUSTED")
-            logger.error(f"=" * 80)
-            logger.error(f"📊 Total Models Tried: {len(deployments_to_try)}")
-            logger.error(f"📊 Successful Models: {len([a for a in model_attempts if a['status'] == 'success'])}")
-            logger.error(f"📊 Failed Models: {len([a for a in model_attempts if a['status'] == 'failed'])}")
-            logger.error(f"=" * 80)
-            logger.error(f"📊 DETAILED SUMMARY OF ALL MODEL ATTEMPTS:")
-            logger.error(f"=" * 80)
-            for i, attempt in enumerate(model_attempts, 1):
-                status_icon = "✅" if attempt["status"] == "success" else "❌"
-                logger.error(f"{status_icon} Model {i}: {attempt['model']}")
-                logger.error(f"   Status: {attempt['status']}")
-                logger.error(f"   Message: {attempt.get('message', 'N/A')}")
-            logger.error(f"=" * 80)
-            logger.error(f"❌ All {len(deployments_to_try)} models exhausted - no more models to try")
-            logger.error(f"❌ Last Error: {str(last_error)[:200] if last_error else 'Unknown'}")
-            logger.error(f"=" * 80)
-            break
+            if retry_count <= max_retries:
+                logger.warning(f"🔄 Retrying Claude Opus 4.5... (attempt {retry_count}/{max_retries})")
+                continue
+            else:
+                logger.error(f"⚠️ Claude Opus 4.5 exhausted all retries")
+                break
     
-    # Fallback response if all models fail after all retries
+    # Fallback response if all retries fail
     fallback_response = """{"status": "reject", "missing_elements": ["Unable to validate due to AI service error - please try again"], "safety_concerns": [], "analysis": "AI validation service temporarily unavailable. Please try again.", "word_count_analysis": "Unable to analyze due to service error", "content_quality": "Unable to assess due to service error"}"""
     
-    logger.warning(f"⚠️ All models failed. Using fallback response")
+    logger.warning(f"⚠️ Claude Opus 4.5 failed after {max_retries + 1} attempts. Using fallback response")
     if last_error:
-        logger.warning(f"⚠️ Last error from models: {str(last_error)[:200]}")
+        logger.warning(f"⚠️ Last error: {str(last_error)[:200]}")
     
     return fallback_response
 
@@ -2699,7 +2208,7 @@ async def create_thread():
     """Create a new conversation thread"""
     try:
         thread_id = str(uuid.uuid4())
-        azure_service.conversations[thread_id] = [
+        claude_service.conversations[thread_id] = [
             {
                 "role": "system",
                 "content": "You are an AI assistant that helps people find information."
@@ -2719,7 +2228,7 @@ async def create_thread():
 async def send_message(request: MessageRequest):
     """Send a message to Azure OpenAI"""
     try:
-        response = await azure_service.send_message(request.thread_id, request.message)
+        response = await claude_service.send_message(request.thread_id, request.message)
         
         return MessageResponse(
             success=True,
@@ -2735,7 +2244,7 @@ async def send_message(request: MessageRequest):
 async def get_thread_messages(thread_id: str):
     """Get all messages for a thread"""
     try:
-        messages = azure_service.get_thread_messages(thread_id)
+        messages = claude_service.get_thread_messages(thread_id)
         
         return ThreadMessagesResponse(
             success=True,
@@ -2750,7 +2259,7 @@ async def get_thread_messages(thread_id: str):
 async def validate_response(request: ResponseValidationRequest):
     """Validate if a response is detailed enough"""
     try:
-        validation_result = azure_service.validate_response_detail(
+        validation_result = claude_service.validate_response_detail(
             request.response, 
             request.question_type
         )
@@ -2768,7 +2277,7 @@ async def validate_response(request: ResponseValidationRequest):
 async def validate_service_relevance(request: ServiceValidationRequest):
     """Validate if a response is relevant to the selected services"""
     try:
-        validation_result = azure_service.validate_service_relevance(
+        validation_result = claude_service.validate_service_relevance(
             request.response, 
             request.selected_services,
             request.question_type
@@ -2800,7 +2309,7 @@ async def prescreener_validate_strict(request: PrescreenerRequest):
         logger.info(f"🔍 PRESCREENER - Validating message for client: {request.clientId}")
         logger.info(f"📝 Message: {request.message}")
         
-        validation_result = azure_service.prescreener_strict_validation(
+        validation_result = claude_service.prescreener_strict_validation(
             request.message,
             request.clientId,
             request.context
@@ -2956,8 +2465,8 @@ async def validate_location_explanation(request: LocationExceptionRequest):
         logger.info(f"📍 Distance: {request.distance_meters:.2f} meters")
         logger.info(f"📍 Explanation: '{request.explanation[:100]}...'")
         
-        if not azure_service._initialized:
-            azure_service._initialize_client()
+        if not claude_service._initialized:
+            claude_service._initialize_client()
         
         # Use validate_answer_with_ai if guardrails are provided, otherwise use fallback
         if request.question_guardrail:
@@ -3128,8 +2637,8 @@ async def prescreen_message(request: PrescreenerRequest):
 async def detect_conflicts(request: ConflictDetectionRequest):
     """Detect conflicts between concepts"""
     try:
-        if not azure_service._initialized:
-            azure_service._initialize_client()
+        if not claude_service._initialized:
+            claude_service._initialize_client()
         
         # Create conflict detection prompt
         concepts_text = ", ".join(request.concepts)
@@ -3160,28 +2669,20 @@ Respond in this exact JSON format:
 CRITICAL: Return only valid JSON. Do not include any text before or after the JSON object.
 """
 
-        response = azure_service.client.chat.completions.create(
-            model=azure_service.deployment,
+        response = claude_service.client.messages.create(
+            model=claude_service.model,
+            max_tokens=500,
+            temperature=0.3,
+            system="You are a healthcare assistant that identifies and resolves conflicts in care concepts.",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a healthcare assistant that identifies and resolves conflicts in care concepts."
-                },
                 {
                     "role": "user",
                     "content": conflict_prompt
                 }
-            ],
-            max_tokens=500,
-            temperature=0.3,
-            top_p=0.95,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=None,
-            stream=False
+            ]
         )
         
-        response_content = response.choices[0].message.content.strip()
+        response_content = response.content[0].text.strip()
         
         # Parse JSON response
         import json
@@ -3212,8 +2713,8 @@ CRITICAL: Return only valid JSON. Do not include any text before or after the JS
 async def generate_narrative(request: NarrativeRequest):
     """Generate dynamic narrative based on shift information"""
     try:
-        if not azure_service._initialized:
-            azure_service._initialize_client()
+        if not claude_service._initialized:
+            claude_service._initialize_client()
         
         # Extract narrative requirements from context
         narrative_reqs = request.context.get("narrativeRequirements", {})
@@ -3253,28 +2754,20 @@ IMPORTANT:
 Respond with just the narrative text, no additional formatting.
 """
 
-        response = azure_service.client.chat.completions.create(
-            model=azure_service.deployment,
+        response = claude_service.client.messages.create(
+            model=claude_service.model,
+            max_tokens=800,
+            temperature=0.7,
+            system="You are a healthcare documentation assistant that creates detailed, engaging shift narratives.",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a healthcare documentation assistant that creates detailed, engaging shift narratives."
-                },
                 {
                     "role": "user",
                     "content": narrative_prompt
                 }
-            ],
-            max_tokens=800,
-            temperature=0.7,
-            top_p=0.95,
-            frequency_penalty=0,
-            presence_penalty=0,
-            stop=None,
-            stream=False
+            ]
         )
         
-        narrative = response.choices[0].message.content.strip()
+        narrative = response.content[0].text.strip()
         
         return NarrativeResponse(narrative=narrative)
         
@@ -3629,7 +3122,7 @@ async def check_grammar(request: GrammarCheckRequest):
     try:
         logger.info(f"🔍 Grammar check requested for text: {request.text[:100]}...")
         
-        result = azure_service.check_grammar(request.text)
+        result = claude_service.check_grammar(request.text)
         
         # Convert errors to GrammarError models
         grammar_errors = [
@@ -3670,7 +3163,7 @@ async def quick_grammar_check(request: GrammarCheckRequest):
     try:
         logger.info(f"⚡ Quick grammar check requested for text: {request.text[:100]}...")
         
-        corrected_text = azure_service.quick_grammar_check(request.text)
+        corrected_text = claude_service.quick_grammar_check(request.text)
         
         logger.info(f"✅ Quick grammar check completed")
         return {
