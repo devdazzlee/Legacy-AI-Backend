@@ -2569,6 +2569,242 @@ async def log_location_exception(request: LogLocationExceptionRequest):
         logger.error(f"❌ ERROR LOGGING LOCATION EXCEPTION: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error logging location exception: {str(e)}")
 
+# ============================================
+# NEW: Follow-up Questions Flow for Location Explanations
+# ============================================
+
+class GenerateFollowUpQuestionsRequest(BaseModel):
+    explanation: str  # User's initial explanation
+    guardrail: str  # The guardrail requirements
+    guideline: Optional[str] = None  # Optional guideline shown to user
+    missing_elements: List[str] = []  # Elements AI detected as missing
+
+class FollowUpQuestion(BaseModel):
+    id: int
+    question: str
+    placeholder: str = ""  # Placeholder text for input
+
+class GenerateFollowUpQuestionsResponse(BaseModel):
+    has_questions: bool  # True if there are follow-up questions
+    questions: List[FollowUpQuestion] = []
+    message: str  # Status message
+
+@app.post("/generate-followup-questions", response_model=GenerateFollowUpQuestionsResponse)
+async def generate_followup_questions(request: GenerateFollowUpQuestionsRequest):
+    """
+    Generate simple follow-up questions based on GUARDRAIL requirements.
+    Questions are written at preschool/2nd grade reading level.
+    The guardrail contains the validation rules - questions are generated based on what's missing.
+    """
+    try:
+        logger.info(f"📝 GENERATING FOLLOW-UP QUESTIONS BASED ON GUARDRAIL")
+        logger.info(f"📝 Explanation: '{request.explanation[:100]}...'")
+        logger.info(f"📝 Guardrail: '{request.guardrail[:200] if request.guardrail else 'None'}...'")
+        logger.info(f"📝 Missing elements: {request.missing_elements}")
+        
+        if not claude_service._initialized:
+            claude_service._initialize_client()
+        
+        # If no guardrail provided, return no questions
+        if not request.guardrail or not request.guardrail.strip():
+            return GenerateFollowUpQuestionsResponse(
+                has_questions=False,
+                questions=[],
+                message="No guardrail provided for question generation"
+            )
+        
+        # If no missing elements, return no questions
+        if not request.missing_elements or len(request.missing_elements) == 0:
+            return GenerateFollowUpQuestionsResponse(
+                has_questions=False,
+                questions=[],
+                message="No follow-up questions needed"
+            )
+        
+        # Generate simple questions using AI based on GUARDRAIL
+        prompt = f"""You are helping a caregiver complete their check-in explanation.
+
+GUARDRAIL (validation requirements):
+{request.guardrail}
+
+User's original explanation: "{request.explanation}"
+
+The following requirements from the GUARDRAIL are MISSING from their explanation:
+{chr(10).join([f"- {elem}" for elem in request.missing_elements])}
+
+Generate ONE simple question for EACH missing requirement from the guardrail.
+CRITICAL RULES:
+1. Questions MUST be at preschool/2nd grade reading level (ages 5-8)
+2. Use VERY simple words (no jargon, no complex words)
+3. Keep questions SHORT - max 8 words
+4. Ask for ONE specific piece of information per question
+5. Make questions friendly and easy to understand
+6. Questions must help gather the SPECIFIC information required by the guardrail
+
+Example good questions:
+- "What's the doctor's last name?"
+- "Where did you go?"
+- "Who said it was okay?"
+- "What store did you visit?"
+- "What time was your appointment?"
+
+Return ONLY a JSON array of objects with "question" and "placeholder" fields.
+Example: [{{"question": "What's the doctor's last name?", "placeholder": "Dr. Smith"}}]
+
+Generate questions now:"""
+
+        response = claude_service.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        response_text = response.content[0].text.strip()
+        logger.info(f"📝 AI Response: {response_text}")
+        
+        # Parse JSON from response
+        try:
+            # Extract JSON array from response
+            import re
+            json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
+            if json_match:
+                questions_data = json.loads(json_match.group())
+            else:
+                questions_data = json.loads(response_text)
+        except json.JSONDecodeError:
+            logger.error(f"❌ Failed to parse AI response as JSON: {response_text}")
+            # Fallback: create simple questions from missing elements
+            questions_data = []
+            for elem in request.missing_elements:
+                elem_lower = elem.lower()
+                if "doctor" in elem_lower or "name" in elem_lower:
+                    questions_data.append({"question": "What's the doctor's last name?", "placeholder": "Dr. Smith"})
+                elif "location" in elem_lower or "where" in elem_lower or "place" in elem_lower:
+                    questions_data.append({"question": "Where did you go?", "placeholder": "Doctor's office"})
+                elif "reason" in elem_lower or "why" in elem_lower:
+                    questions_data.append({"question": "Why did you go there?", "placeholder": "For an appointment"})
+                elif "authorized" in elem_lower or "permission" in elem_lower or "who" in elem_lower:
+                    questions_data.append({"question": "Who said it was okay?", "placeholder": "My supervisor"})
+                else:
+                    questions_data.append({"question": f"Can you tell us about {elem.lower()}?", "placeholder": ""})
+        
+        # Convert to FollowUpQuestion objects
+        questions = []
+        for idx, q in enumerate(questions_data):
+            questions.append(FollowUpQuestion(
+                id=idx + 1,
+                question=q.get("question", ""),
+                placeholder=q.get("placeholder", "")
+            ))
+        
+        logger.info(f"✅ Generated {len(questions)} follow-up questions")
+        
+        return GenerateFollowUpQuestionsResponse(
+            has_questions=len(questions) > 0,
+            questions=questions,
+            message=f"Generated {len(questions)} follow-up questions"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ ERROR GENERATING FOLLOW-UP QUESTIONS: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating follow-up questions: {str(e)}")
+
+
+class ValidateFollowUpAnswersRequest(BaseModel):
+    original_explanation: str  # User's original explanation
+    questions_and_answers: List[Dict[str, str]]  # List of {"question": "...", "answer": "..."}
+    guardrail: str  # The guardrail requirements
+    guideline: Optional[str] = None  # Optional guideline
+
+class ValidateFollowUpAnswersResponse(BaseModel):
+    is_complete: bool  # True if combined answers meet requirements
+    status: str  # "accept" or "reject"
+    message: str
+    combined_explanation: str  # The full combined explanation
+
+@app.post("/validate-followup-answers", response_model=ValidateFollowUpAnswersResponse)
+async def validate_followup_answers(request: ValidateFollowUpAnswersRequest):
+    """
+    Validate ALL follow-up answers together (not one by one).
+    Combines original explanation with all answers and checks against GUARDRAIL.
+    """
+    try:
+        logger.info(f"✅ VALIDATING FOLLOW-UP ANSWERS AGAINST GUARDRAIL")
+        logger.info(f"📝 Original explanation: '{request.original_explanation[:100]}...'")
+        logger.info(f"📝 Guardrail: '{request.guardrail[:200] if request.guardrail else 'None'}...'")
+        logger.info(f"📝 Number of Q&A pairs: {len(request.questions_and_answers)}")
+        
+        if not claude_service._initialized:
+            claude_service._initialize_client()
+        
+        # Combine original explanation with all answers
+        combined_parts = [request.original_explanation]
+        for qa in request.questions_and_answers:
+            question = qa.get("question", "")
+            answer = qa.get("answer", "").strip()
+            if answer:
+                combined_parts.append(f"{answer}")
+        
+        combined_explanation = " ".join(combined_parts)
+        logger.info(f"📝 Combined explanation: '{combined_explanation[:200]}...'")
+        
+        # Validate combined explanation against GUARDRAIL (validation rules)
+        prompt = f"""You are validating a caregiver's explanation for being at a different location.
+
+GUARDRAIL (validation requirements that MUST be met):
+{request.guardrail}
+
+USER'S COMBINED EXPLANATION (original + follow-up answers):
+"{combined_explanation}"
+
+Does this combined explanation meet ALL the GUARDRAIL requirements?
+Check each requirement in the guardrail and verify it's addressed.
+
+Respond with ONLY a JSON object:
+{{"is_complete": true/false, "message": "brief explanation"}}
+
+Be lenient - if the user made a good faith effort and provided basic required information, mark as complete."""
+
+        response = claude_service.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        response_text = response.content[0].text.strip()
+        logger.info(f"📝 AI Validation Response: {response_text}")
+        
+        # Parse response
+        try:
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+            else:
+                result = json.loads(response_text)
+            
+            is_complete = result.get("is_complete", True)  # Default to true (lenient)
+            message = result.get("message", "Explanation reviewed")
+        except json.JSONDecodeError:
+            logger.error(f"❌ Failed to parse validation response: {response_text}")
+            # Default to accepting (lenient approach)
+            is_complete = True
+            message = "Explanation submitted"
+        
+        logger.info(f"✅ Validation result: is_complete={is_complete}, message={message}")
+        
+        return ValidateFollowUpAnswersResponse(
+            is_complete=is_complete,
+            status="accept" if is_complete else "reject",
+            message=message,
+            combined_explanation=combined_explanation
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ ERROR VALIDATING FOLLOW-UP ANSWERS: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error validating follow-up answers: {str(e)}")
+
+
 # AI Prescreener endpoints
 class ConflictDetectionRequest(BaseModel):
     concepts: List[str]
